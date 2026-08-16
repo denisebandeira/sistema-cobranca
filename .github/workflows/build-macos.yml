@@ -30,35 +30,24 @@ jobs:
           pyinstaller \
             --noconfirm \
             --clean \
-            --onedir \
             --windowed \
             --name SistemaCobranca \
-            --add-data "app.py:." \
-            --add-data "parser_pdf_base_mestre_v1_3_estavel.py:." \
-            --hidden-import pdfplumber \
-            --hidden-import pandas \
-            --hidden-import openpyxl \
-            --hidden-import parser_pdf_base_mestre_v1_3_estavel \
-            --collect-all streamlit \
-            --collect-all pdfplumber \
-            --collect-all pandas \
-            --collect-all openpyxl \
-            iniciar_sistema.py
+            app_desktop.py
 
-      - name: Listar arquivos gerados
+      - name: Verificar aplicativo
         run: |
-          find dist -maxdepth 4 -print
+          ls -lah dist
+          ls -lah dist/SistemaCobranca.app
 
       - name: Compactar aplicativo
         run: |
-          cd dist
           ditto -c -k --sequesterRsrc --keepParent \
-            SistemaCobranca.app \
+            dist/SistemaCobranca.app \
             SistemaCobranca-macOS.zip
 
       - name: Publicar aplicativo
         uses: actions/upload-artifact@v4
         with:
           name: SistemaCobranca-macOS
-          path: dist/SistemaCobranca-macOS.zip
+          path: SistemaCobranca-macOS.zip
           if-no-files-found: error
