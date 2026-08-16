@@ -1,0 +1,57 @@
+name: Gerar aplicativo macOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Atualizar pip
+        run: python -m pip install --upgrade pip
+
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Gerar aplicativo macOS
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --windowed \
+            --name SistemaCobranca \
+            --add-data "app.py:." \
+            --add-data "parser_pdf_base_mestre_v1_3_estavel.py:." \
+            --collect-all streamlit \
+            iniciar_sistema.py
+
+      - name: Listar arquivos gerados
+        run: |
+          find dist -maxdepth 4 -print
+
+      - name: Compactar aplicativo
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            SistemaCobranca.app \
+            SistemaCobranca-macOS.zip
+
+      - name: Publicar aplicativo
+        uses: actions/upload-artifact@v4
+        with:
+          name: SistemaCobranca-macOS
+          path: dist/SistemaCobranca-macOS.zip
+          if-no-files-found: error
