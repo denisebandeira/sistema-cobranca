@@ -36,6 +36,9 @@ jobs:
             --add-data "app.py:." \
             --add-data "parser_pdf_base_mestre_v1_3_estavel.py:." \
             --collect-all streamlit \
+            --collect-all pdfplumber \
+            --collect-all pandas \
+            --collect-all openpyxl \
             iniciar_sistema.py
 
       - name: Listar arquivos gerados
