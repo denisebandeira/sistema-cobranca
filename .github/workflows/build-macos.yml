@@ -35,6 +35,10 @@ jobs:
             --name SistemaCobranca \
             --add-data "app.py:." \
             --add-data "parser_pdf_base_mestre_v1_3_estavel.py:." \
+            --hidden-import pdfplumber \
+            --hidden-import pandas \
+            --hidden-import openpyxl \
+            --hidden-import parser_pdf_base_mestre_v1_3_estavel \
             --collect-all streamlit \
             --collect-all pdfplumber \
             --collect-all pandas \
