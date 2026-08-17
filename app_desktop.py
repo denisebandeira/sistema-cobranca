@@ -256,14 +256,27 @@ class SistemaCobrancaApp:
             "Sistema de Cobrança"
         )
 
+        # A janela se adapta à área útil do monitor. No Windows, a escala
+        # de exibição (125% ou 150%) reduz essa área mesmo em tela cheia.
+        largura_tela = self.root.winfo_screenwidth()
+        altura_tela = self.root.winfo_screenheight()
+
+        largura_inicial = min(1100, max(760, largura_tela - 80))
+        altura_inicial = min(820, max(600, altura_tela - 120))
+
         self.root.geometry(
-            "1100x850"
+            f"{largura_inicial}x{altura_inicial}"
         )
 
         self.root.minsize(
-            1000,
-            780
+            760,
+            600
         )
+
+        # Somente a linha da tabela cresce ou diminui. As linhas dos botões
+        # de salvar e do rodapé ficam sempre reservadas e visíveis.
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(3, weight=1, minsize=90)
 
         # =====================================================
         # ESTILO
@@ -331,8 +344,10 @@ class SistemaCobrancaApp:
             padding=(20, 18, 20, 8)
         )
 
-        frame_cabecalho.pack(
-            fill="x"
+        frame_cabecalho.grid(
+            row=0,
+            column=0,
+            sticky="ew"
         )
 
         titulo = ttk.Label(
@@ -366,8 +381,10 @@ class SistemaCobrancaApp:
             padding=15
         )
 
-        frame_selecao.pack(
-            fill="x",
+        frame_selecao.grid(
+            row=1,
+            column=0,
+            sticky="ew",
             padx=20,
             pady=(5, 10)
         )
@@ -433,7 +450,7 @@ class SistemaCobrancaApp:
             frame_lista,
             columns=("arquivo",),
             show="headings",
-            height=6,
+            height=4,
             selectmode="browse"
         )
 
@@ -479,8 +496,10 @@ class SistemaCobrancaApp:
             padding=12
         )
 
-        frame_indicadores.pack(
-            fill="x",
+        frame_indicadores.grid(
+            row=2,
+            column=0,
+            sticky="ew",
             padx=20,
             pady=(0, 10)
         )
@@ -547,9 +566,10 @@ class SistemaCobrancaApp:
             root
         )
 
-        frame_tabela.pack(
-            fill="both",
-            expand=True,
+        frame_tabela.grid(
+            row=3,
+            column=0,
+            sticky="nsew",
             padx=20,
             pady=(0, 10)
         )
@@ -654,7 +674,10 @@ class SistemaCobrancaApp:
             style="Status.TLabel"
         )
 
-        self.label_status.pack(
+        self.label_status.grid(
+            row=4,
+            column=0,
+            sticky="ew",
             pady=(0, 8)
         )
 
@@ -668,8 +691,10 @@ class SistemaCobrancaApp:
             padding=12
         )
 
-        frame_saida.pack(
-            fill="x",
+        frame_saida.grid(
+            row=5,
+            column=0,
+            sticky="ew",
             padx=20,
             pady=(0, 10)
         )
@@ -716,8 +741,10 @@ class SistemaCobrancaApp:
             root
         )
 
-        frame_rodape.pack(
-            fill="x",
+        frame_rodape.grid(
+            row=6,
+            column=0,
+            sticky="ew",
             padx=20,
             pady=(0, 14)
         )
