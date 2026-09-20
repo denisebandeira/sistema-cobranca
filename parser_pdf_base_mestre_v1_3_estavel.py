@@ -236,37 +236,79 @@ def extrair_cabecalho(texto):
     assessor
     imobiliaria
     endereco
+
+    Aceita tanto:
+        Condomínio: ... (Assessor:...) Imobiliária Alfa City
+
+    quanto:
+        Imobiliária Alfa City
+        Condomínio: ... (Assessor:...)
     """
 
-    linhas = texto.splitlines()
+    linhas = [
+        linha.strip()
+        for linha in texto.splitlines()
+        if linha.strip()
+    ]
 
-    if len(linhas) < 2:
+    linha_condominio = None
+    indice_condominio = None
+
+    for indice, linha in enumerate(linhas):
+        if linha.startswith("Condomínio:"):
+            linha_condominio = linha
+            indice_condominio = indice
+            break
+
+    if linha_condominio is None:
         return None
-
-    linha_cabecalho = linhas[0].strip()
-    endereco = linhas[1].strip()
 
     padrao = re.compile(
         r"^Condomínio:\s*"
         r"(?P<codigo>\d+)-"
         r"(?P<condominio>.+?)\s+"
-        r"\(Assessor:\s*(?P<assessor>[^)]+)\)\s+"
-        r"Imobiliária\s+(?P<imobiliaria>.+)$"
+        r"\(Assessor:\s*(?P<assessor>[^)]+)\)"
+        r"(?:\s+Imobiliária\s+(?P<imobiliaria>.+))?$"
     )
 
-    m = padrao.match(linha_cabecalho)
+    m = padrao.match(linha_condominio)
 
     if not m:
         return None
+
+    imobiliaria = (
+        m.group("imobiliaria").strip()
+        if m.group("imobiliaria")
+        else ""
+    )
+
+    # No formato novo, a imobiliária aparece em linha separada.
+    if not imobiliaria:
+        for linha in linhas[:10]:
+            if linha.startswith("Imobiliária "):
+                imobiliaria = (
+                    linha
+                    .removeprefix("Imobiliária ")
+                    .strip()
+                )
+                break
+
+    # O endereço é a primeira linha após a linha do condomínio.
+    endereco = ""
+
+    if (
+        indice_condominio is not None
+        and indice_condominio + 1 < len(linhas)
+    ):
+        endereco = linhas[indice_condominio + 1]
 
     return {
         "codigo_condominio": m.group("codigo"),
         "condominio": m.group("condominio").strip(),
         "assessor": m.group("assessor").strip(),
-        "imobiliaria": m.group("imobiliaria").strip(),
+        "imobiliaria": imobiliaria,
         "endereco": endereco
     }
-
 
 # ============================================================
 # CAMPO FINAL:
@@ -302,6 +344,7 @@ def separar_valor_corrigido_nosso_numero(campo):
 
     padrao = re.compile(
         r"^(?P<vlr_corrigido>\d{1,3}(?:\.\d{3})*,\d{2})"
+        r"\s*"
         r"(?P<nosso_numero>\d+)"
         r"(?:\s+(?P<advogado>.+))?$"
     )
