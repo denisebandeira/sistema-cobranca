@@ -33,6 +33,10 @@ from parser_pdf_base_mestre_v1_3_estavel import (
     gerar_resumo,
     validar_estrutura
 )
+from gerador_comunicados import (
+    caminho_modelo_padrao,
+    gerar_pacote_comunicados_zip,
+)
 
 
 # =============================================================================
@@ -733,6 +737,20 @@ class SistemaCobrancaApp:
             padx=5
         )
 
+        self.botao_comunicados = ttk.Button(
+            frame_botoes_saida,
+            text="Salvar Comunicados por Condomínio",
+            command=self.salvar_comunicados,
+            state="disabled",
+            style="Secundario.TButton"
+        )
+
+        self.botao_comunicados.grid(
+            row=0,
+            column=2,
+            padx=5
+        )
+
         # =====================================================
         # RODAPÉ / ENCERRAR
         # =====================================================
@@ -842,6 +860,10 @@ class SistemaCobrancaApp:
             state="disabled"
         )
 
+        self.botao_comunicados.config(
+            state="disabled"
+        )
+
         self.arquivos_pdf = [
             Path(arquivo)
             for arquivo in arquivos
@@ -914,6 +936,10 @@ class SistemaCobrancaApp:
         )
 
         self.botao_csv.config(
+            state="disabled"
+        )
+
+        self.botao_comunicados.config(
             state="disabled"
         )
 
@@ -1093,6 +1119,10 @@ class SistemaCobrancaApp:
                 state="normal"
             )
 
+            self.botao_comunicados.config(
+                state="normal"
+            )
+
         else:
 
             self.base_mestre = None
@@ -1264,6 +1294,68 @@ class SistemaCobrancaApp:
                 (
                     "Não foi possível salvar "
                     "o arquivo Excel.\n\n"
+                    f"{erro}"
+                )
+            )
+
+
+    # =========================================================================
+    # SALVAR COMUNICADOS DE COBRANÇA
+    # =========================================================================
+
+    def salvar_comunicados(self):
+
+        if self.base_mestre is None:
+            return
+
+        arquivo = filedialog.asksaveasfilename(
+            title="Salvar Comunicados por Condomínio",
+            defaultextension=".zip",
+            initialfile="comunicados_por_condominio.zip",
+            filetypes=[
+                (
+                    "Arquivo ZIP",
+                    "*.zip"
+                )
+            ]
+        )
+
+        if not arquivo:
+            return
+
+        try:
+
+            self.label_status.config(
+                text="Gerando comunicados de cobrança..."
+            )
+            self.root.update()
+
+            conteudo = gerar_pacote_comunicados_zip(
+                self.base_mestre,
+                caminho_modelo_padrao(),
+            )
+
+            Path(arquivo).write_bytes(conteudo)
+
+            self.label_status.config(
+                text="Comunicados gerados com sucesso."
+            )
+
+            messagebox.showinfo(
+                "Sistema de Cobrança",
+                "Arquivos Excel por condomínio gerados com sucesso."
+            )
+
+        except Exception as erro:
+
+            self.label_status.config(
+                text="Erro ao gerar os comunicados."
+            )
+
+            messagebox.showerror(
+                "Erro",
+                (
+                    "Não foi possível gerar os comunicados.\n\n"
                     f"{erro}"
                 )
             )
