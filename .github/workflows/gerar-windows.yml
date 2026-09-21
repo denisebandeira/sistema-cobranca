@@ -29,22 +29,21 @@ jobs:
       - name: Validar arquivos gerados
         shell: pwsh
         run: |
-          $executavel = "dist/SistemaCobranca/SistemaCobranca.exe"
-          $modelo = "dist/SistemaCobranca/_internal/modelo_comunicado.xlsx"
+          $executavel = "dist/SistemaCobranca.exe"
 
           if (-not (Test-Path $executavel)) {
             throw "Executável não encontrado: $executavel"
           }
 
-          if (-not (Test-Path $modelo)) {
-            throw "Modelo de comunicado não encontrado: $modelo"
+          if ((Get-Item $executavel).Length -lt 10MB) {
+            throw "Executável incompleto: a DLL do Python pode não ter sido incorporada."
           }
 
       - name: Compactar aplicativo
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path "dist/SistemaCobranca/*" `
+            -Path "dist/SistemaCobranca.exe" `
             -DestinationPath "SistemaCobranca_Windows.zip" `
             -Force
 
