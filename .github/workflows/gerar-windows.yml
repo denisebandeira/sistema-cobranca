@@ -30,6 +30,7 @@ jobs:
         shell: pwsh
         run: |
           $executavel = "dist/SistemaCobranca.exe"
+          $marcador = "MODO_PORTATIL.txt"
 
           if (-not (Test-Path $executavel)) {
             throw "Executável não encontrado: $executavel"
@@ -39,18 +40,24 @@ jobs:
             throw "Executável incompleto: a DLL do Python pode não ter sido incorporada."
           }
 
-      - name: Compactar aplicativo
+          if (-not (Test-Path $marcador)) {
+            throw "Marcador do modo portátil não encontrado: $marcador"
+          }
+
+      - name: Compactar aplicativo portátil
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path "Entrega_Carla" | Out-Null
+          Copy-Item "dist/SistemaCobranca.exe" "Entrega_Carla/SistemaCobranca.exe"
+          Copy-Item "MODO_PORTATIL.txt" "Entrega_Carla/MODO_PORTATIL.txt"
           Compress-Archive `
-            -Path "dist/SistemaCobranca.exe" `
-            -DestinationPath "SistemaCobranca_Windows.zip" `
-            -Force
+            -Path "Entrega_Carla" `
+            -DestinationPath "SistemaCobranca_Windows_portatil.zip"
 
       - name: Disponibilizar aplicativo
         uses: actions/upload-artifact@v4
         with:
-          name: SistemaCobranca-Windows
-          path: SistemaCobranca_Windows.zip
+          name: SistemaCobranca-Windows-portatil
+          path: SistemaCobranca_Windows_portatil.zip
           if-no-files-found: error
           retention-days: 30
