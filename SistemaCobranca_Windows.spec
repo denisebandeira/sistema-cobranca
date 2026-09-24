@@ -5,8 +5,14 @@ a = Analysis(
     ['app_desktop.py'],
     pathex=[],
     binaries=[],
-    datas=[('modelo_comunicado.xlsx', '.')],
-    hiddenimports=[],
+    datas=[
+        ('modelo_comunicado.xlsx', '.'),
+        ('modelo_importacao_contatos.xlsx', '.'),
+    ],
+    hiddenimports=[
+        'banco_dados', 'cargas_dados', 'gerador_comunicados',
+        'modulo_comunicacoes', 'modulo_consultas',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

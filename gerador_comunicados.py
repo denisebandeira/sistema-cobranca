@@ -84,6 +84,34 @@ def gerar_comunicados_excel(
     )
 
 
+def gerar_comunicado_individual_excel(
+    base_mestre: pd.DataFrame,
+    modelo: str | Path | BinaryIO,
+    *,
+    codigo_condominio: str,
+    economia: str,
+    nome_condomino: str,
+    data_referencia: date | datetime | None = None,
+    taxa_honorarios: float = TAXA_HONORARIOS_PADRAO,
+) -> bytes:
+    """Gera uma unica aba, usando as mesmas regras do pacote por condominio."""
+
+    base = _preparar_base(base_mestre)
+    selecionada = base.loc[
+        (base["codigo_condominio"] == str(codigo_condominio).strip())
+        & (base["economia"] == str(economia).strip())
+        & (base["nome_condomino"] == str(nome_condomino).strip())
+    ]
+    if selecionada.empty:
+        raise ValueError("O devedor selecionado não consta nesta carga.")
+    return gerar_comunicados_excel(
+        selecionada,
+        modelo,
+        data_referencia=data_referencia,
+        taxa_honorarios=taxa_honorarios,
+    )
+
+
 def gerar_comunicados_por_condominio(
     base_mestre: pd.DataFrame,
     modelo: str | Path | BinaryIO,
@@ -434,17 +462,28 @@ def _nome_aba_unico(
     nome: str,
     usados: set[str],
 ) -> str:
-    unidade = _unidade_exibicao(economia)
-    base = f"{nome} {unidade}".strip()
-    base = re.sub(r"[\\/*?:\[\]]", " ", base)
-    base = re.sub(r"\s+", " ", base).strip(" '") or f"Comunicado {codigo}"
-    base = base[:31].rstrip()
+    def limpar(texto: str) -> str:
+        texto = re.sub(r"[\\/*?:\[\]]", " ", texto)
+        return re.sub(r"\s+", " ", texto).strip(" '")
 
-    candidato = base
+    devedor = limpar(nome) or f"Comunicado {codigo}"
+    identificador = limpar(economia) or "Sem economia"
+
+    def candidato_com_sufixo(sufixo: str) -> str:
+        limite = 31 - len(sufixo)
+        # O Excel limita o título a 31 caracteres. Preservamos a economia
+        # inteira sempre que possível e abreviamos primeiro o nome.
+        tamanho_economia = min(len(identificador), limite - 5)
+        economia_exibida = identificador[:tamanho_economia].rstrip()
+        tamanho_nome = limite - len(economia_exibida) - 3
+        nome_exibido = devedor[:tamanho_nome].rstrip()
+        return f"{nome_exibido} - {economia_exibida}{sufixo}"
+
+    candidato = candidato_com_sufixo("")
     contador = 2
     while candidato.casefold() in usados:
         sufixo = f" ({contador})"
-        candidato = f"{base[:31 - len(sufixo)]}{sufixo}"
+        candidato = candidato_com_sufixo(sufixo)
         contador += 1
 
     usados.add(candidato.casefold())

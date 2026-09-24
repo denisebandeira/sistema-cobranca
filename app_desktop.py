@@ -9,6 +9,8 @@
 # =============================================================================
 
 from pathlib import Path
+import shutil
+import sys
 import tkinter as tk
 from tkinter import (
     filedialog,
@@ -17,6 +19,11 @@ from tkinter import (
 )
 
 import pandas as pd
+
+from banco_dados import (
+    caminho_banco, caminho_banco_local, importar_telefones, inicializar_banco,
+    migrar_banco_local_para_portatil, modo_portatil_ativo, sincronizar_devedores,
+)
 
 from openpyxl import load_workbook
 from openpyxl.styles import (
@@ -37,6 +44,13 @@ from gerador_comunicados import (
     caminho_modelo_padrao,
     gerar_pacote_comunicados_zip,
 )
+from modulo_comunicacoes import (
+    NOME_MODELO,
+    caminho_modelo_importacao,
+    ler_planilha_contatos,
+)
+from modulo_consultas import JanelaConsultas
+from cargas_dados import carregar_base_atual, listar_condominios_atuais, registrar_carga
 
 
 # =============================================================================
@@ -265,22 +279,26 @@ class SistemaCobrancaApp:
         largura_tela = self.root.winfo_screenwidth()
         altura_tela = self.root.winfo_screenheight()
 
-        largura_inicial = min(1100, max(760, largura_tela - 80))
-        altura_inicial = min(820, max(600, altura_tela - 120))
+        largura_inicial = min(1250, max(900, largura_tela - 60))
+        altura_inicial = min(850, max(620, altura_tela - 100))
 
         self.root.geometry(
             f"{largura_inicial}x{altura_inicial}"
         )
 
         self.root.minsize(
-            760,
-            600
+            min(950, largura_tela - 60),
+            min(640, altura_tela - 100)
         )
+        # No Mac, abre em tela cheia; no Windows, maximiza mantendo a barra
+        # do sistema. Escape sai da tela cheia do Mac.
+        self.root.bind("<Escape>", self.sair_tela_cheia)
+        self.root.after_idle(self.abrir_em_tela_cheia)
 
         # Somente a linha da tabela cresce ou diminui. As linhas dos botões
         # de salvar e do rodapé ficam sempre reservadas e visíveis.
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=1, minsize=90)
+        self.root.rowconfigure(1, weight=1)
 
         # =====================================================
         # ESTILO
@@ -339,12 +357,40 @@ class SistemaCobrancaApp:
 
         self.relatorio = None
 
+        self.devedores_com_contatos = None
+
+        self.resumo_contatos = None
+
+        # A primeira aba reúne importação e saídas; a consulta permanece
+        # acessível sem abrir janelas intermediárias.
+        barra = ttk.Frame(root, padding=(16, 8))
+        barra.grid(row=0, column=0, sticky="ew")
+        linha_titulo = ttk.Frame(barra)
+        linha_titulo.pack(fill="x")
+        ttk.Label(
+            linha_titulo, text="Sistema de Cobrança — versão de teste",
+            font=("Arial", 16, "bold"),
+        ).pack(side="left")
+        self.botao_encerrar = ttk.Button(
+            linha_titulo, text="Sair", command=self.encerrar_sistema
+        )
+        self.botao_encerrar.pack(side="right")
+
+        self.abas_principais = ttk.Notebook(root)
+        self.abas_principais.grid(row=1, column=0, sticky="nsew")
+        self.tela_consulta = ttk.Frame(self.abas_principais)
+        self.tela_importacao = ttk.Frame(self.abas_principais)
+        self.abas_principais.add(self.tela_importacao, text="Importar / salvar")
+        self.abas_principais.add(self.tela_consulta, text="Condomínios / devedores")
+        self.tela_importacao.columnconfigure(0, weight=1)
+        self.tela_importacao.rowconfigure(3, weight=1, minsize=90)
+
         # =====================================================
         # CABEÇALHO
         # =====================================================
 
         frame_cabecalho = ttk.Frame(
-            root,
+            self.tela_importacao,
             padding=(20, 18, 20, 8)
         )
 
@@ -354,12 +400,15 @@ class SistemaCobrancaApp:
             sticky="ew"
         )
 
-        titulo = ttk.Label(
+        self.label_carga_atual = ttk.Label(
             frame_cabecalho,
-            text="Sistema de Cobrança",
-            style="Titulo.TLabel"
+            text="Sem carga salva",
         )
+        self.label_carga_atual.pack(anchor="e")
 
+        titulo = ttk.Label(
+            frame_cabecalho, text="Importação de PDFs", style="Titulo.TLabel"
+        )
         titulo.pack()
 
         subtitulo = ttk.Label(
@@ -380,7 +429,7 @@ class SistemaCobrancaApp:
         # =====================================================
 
         frame_selecao = ttk.LabelFrame(
-            root,
+            self.tela_importacao,
             text="1. Seleção dos relatórios",
             padding=15
         )
@@ -495,7 +544,7 @@ class SistemaCobrancaApp:
         # =====================================================
 
         frame_indicadores = ttk.LabelFrame(
-            root,
+            self.tela_importacao,
             text="2. Resultado do processamento",
             padding=12
         )
@@ -567,7 +616,7 @@ class SistemaCobrancaApp:
         # =====================================================
 
         frame_tabela = ttk.Frame(
-            root
+            self.tela_importacao
         )
 
         frame_tabela.grid(
@@ -642,7 +691,7 @@ class SistemaCobrancaApp:
 
         self.tabela.column(
             "status",
-            width=130,
+            width=160,
             anchor="center"
         )
 
@@ -672,7 +721,7 @@ class SistemaCobrancaApp:
         # =====================================================
 
         self.label_status = ttk.Label(
-            root,
+            self.tela_importacao,
             text="Pronto.",
             anchor="center",
             style="Status.TLabel"
@@ -689,11 +738,7 @@ class SistemaCobrancaApp:
         # SAÍDAS
         # =====================================================
 
-        frame_saida = ttk.LabelFrame(
-            root,
-            text="3. Arquivos de saída",
-            padding=12
-        )
+        frame_saida = ttk.Frame(self.tela_importacao, padding=(0, 4))
 
         frame_saida.grid(
             row=5,
@@ -703,91 +748,65 @@ class SistemaCobrancaApp:
             pady=(0, 10)
         )
 
-        frame_botoes_saida = ttk.Frame(
-            frame_saida
-        )
+        for coluna in range(3):
+            frame_saida.columnconfigure(coluna, weight=1, uniform="saidas")
 
-        frame_botoes_saida.pack()
+        area_mestre = ttk.LabelFrame(
+            frame_saida, text="Exportar Base Mestre", padding=10
+        )
+        area_comunicados = ttk.LabelFrame(
+            frame_saida, text="Exportar comunicados", padding=10
+        )
+        area_telefones = ttk.LabelFrame(
+            frame_saida, text="Importar telefones", padding=10
+        )
+        for coluna, area in enumerate(
+            (area_mestre, area_comunicados, area_telefones)
+        ):
+            area.grid(row=0, column=coluna, padx=5, sticky="nsew")
 
         self.botao_excel = ttk.Button(
-            frame_botoes_saida,
+            area_mestre,
             text="Salvar Base Mestre Excel",
             command=self.salvar_excel,
             state="disabled",
-            style="Secundario.TButton"
+            style="Secundario.TButton",
         )
+        self.botao_excel.pack(fill="x", pady=(0, 6))
 
-        self.botao_excel.grid(
-            row=0,
-            column=0,
-            padx=5
+        self.botao_comunicados = ttk.Button(
+            area_comunicados,
+            text="Salvar Comunicados por Condomínio",
+            command=self.salvar_comunicados,
+            state="disabled",
+            style="Secundario.TButton",
         )
+        self.botao_comunicados.pack(fill="x")
 
         self.botao_csv = ttk.Button(
-            frame_botoes_saida,
+            area_mestre,
             text="Salvar Base Mestre CSV",
             command=self.salvar_csv,
             state="disabled",
             style="Secundario.TButton"
         )
 
-        self.botao_csv.grid(
-            row=0,
-            column=1,
-            padx=5
-        )
+        self.botao_csv.pack(fill="x")
 
-        self.botao_comunicados = ttk.Button(
-            frame_botoes_saida,
-            text="Salvar Comunicados por Condomínio",
-            command=self.salvar_comunicados,
-            state="disabled",
+        self.botao_importar_telefones = ttk.Button(
+            area_telefones,
+            text="Selecionar planilha",
+            command=self.importar_planilha_telefones,
             style="Secundario.TButton"
         )
-
-        self.botao_comunicados.grid(
-            row=0,
-            column=2,
-            padx=5
-        )
-
-        # =====================================================
-        # RODAPÉ / ENCERRAR
-        # =====================================================
-
-        frame_rodape = ttk.Frame(
-            root
-        )
-
-        frame_rodape.grid(
-            row=6,
-            column=0,
-            sticky="ew",
-            padx=20,
-            pady=(0, 14)
-        )
-
-        rodape = ttk.Label(
-            frame_rodape,
-            text="Sistema de Cobrança — Módulo 1"
-        )
-
-        rodape.pack(
-            side="left"
-        )
-
-        self.botao_encerrar = ttk.Button(
-            frame_rodape,
-            text="Encerrar sistema",
-            command=self.encerrar_sistema,
+        self.botao_importar_telefones.pack(fill="x", pady=(0, 6))
+        ttk.Button(
+            area_telefones, text="Salvar modelo de telefones",
+            command=self.salvar_modelo_telefones,
             style="Secundario.TButton",
-            width=18
-        )
-
-        self.botao_encerrar.pack(
-            side="right",
-            padx=(10, 0)
-        )
+        ).pack(fill="x")
+        self.consulta = JanelaConsultas(self.tela_consulta, incorporada=True)
+        self.consulta.janela.pack(fill="both", expand=True)
 
         # Fecha pela bolinha vermelha no macOS
         # ou pelo X no Windows usando a mesma confirmação.
@@ -795,6 +814,154 @@ class SistemaCobrancaApp:
             "WM_DELETE_WINDOW",
             self.encerrar_sistema
         )
+
+        self.carregar_base_persistida(mostrar_condominios=True)
+
+
+    def abrir_em_tela_cheia(self) -> None:
+        try:
+            if sys.platform == "darwin":
+                self.root.attributes("-fullscreen", True)
+            elif sys.platform == "win32":
+                self.root.state("zoomed")
+            else:
+                self.root.attributes("-zoomed", True)
+        except tk.TclError:
+            # Alguns Tk não oferecem a opção de maximização. Nesse caso,
+            # usamos a área da tela como aproximação.
+            self.root.geometry(
+                f"{self.root.winfo_screenwidth()}x"
+                f"{self.root.winfo_screenheight()}+0+0"
+            )
+
+    def sair_tela_cheia(self, _evento=None) -> None:
+        if sys.platform == "darwin":
+            try:
+                self.root.attributes("-fullscreen", False)
+            except tk.TclError:
+                pass
+
+
+    def carregar_base_persistida(self, *, mostrar_condominios=False):
+        """Restaura a visao atual sem exigir nova importacao dos PDFs."""
+
+        base = carregar_base_atual()
+        self.base_mestre = base if not base.empty else None
+
+        if self.base_mestre is None:
+            self.resumo = None
+            self.validacao_estrutura = None
+            self.devedores_com_contatos = None
+            self.resumo_contatos = None
+        else:
+            self.resumo = gerar_resumo(self.base_mestre)
+            self.validacao_estrutura = validar_estrutura(self.base_mestre)
+            contatos = sincronizar_devedores(self.resumo.to_dict(orient="records"))
+            self.devedores_com_contatos = pd.DataFrame(contatos)
+            com_telefone = sum(bool(contato["telefone"]) for contato in contatos)
+            self.resumo_contatos = {
+                "total": len(contatos),
+                "com_telefone": com_telefone,
+                "sem_telefone": len(contatos) - com_telefone,
+            }
+
+        estado = "normal" if self.base_mestre is not None else "disabled"
+        for botao in (self.botao_excel, self.botao_csv, self.botao_comunicados):
+            botao.config(state=estado)
+
+        self.label_registros.config(
+            text=f"Registros consolidados: {len(base)}"
+        )
+
+        if mostrar_condominios:
+            for item in self.tabela.get_children():
+                self.tabela.delete(item)
+            condominios = listar_condominios_atuais()
+            for condominio in condominios:
+                arquivos = ", ".join(
+                    item["nome"] for item in condominio["arquivos"]
+                )
+                self.tabela.insert(
+                    "",
+                    "end",
+                    values=(
+                        arquivos,
+                        condominio["codigo_condominio"],
+                        condominio["condominio"],
+                        condominio["quantidade_lancamentos"],
+                        condominio["criada_em"][:16].replace("T", " "),
+                    ),
+                )
+            if condominios:
+                datas = [item["criada_em"] for item in condominios]
+                self.label_status.config(
+                    text=(
+                        "Dados recuperados do banco. "
+                        f"Última atualização: {max(datas)[:16].replace('T', ' ')}."
+                    )
+                )
+        condominios_atuais = listar_condominios_atuais()
+        if condominios_atuais:
+            data_mais_recente = max(item["criada_em"] for item in condominios_atuais)
+            self.label_carga_atual.config(
+                text=f"Última carga: {data_mais_recente[:16].replace('T', ' ')}"
+            )
+        else:
+            self.label_carga_atual.config(text="Sem carga salva")
+        self.consulta.atualizar_condominios()
+
+    def importar_planilha_telefones(self) -> None:
+        arquivo = filedialog.askopenfilename(
+            title="Selecionar planilha de telefones",
+            filetypes=[
+                ("Planilhas aceitas", "*.xlsx *.csv"),
+                ("Excel", "*.xlsx"),
+                ("CSV", "*.csv"),
+            ],
+            parent=self.root,
+        )
+        if not arquivo:
+            return
+        try:
+            leitura = ler_planilha_contatos(arquivo)
+            resultado = importar_telefones(leitura["registros"])
+            erros = leitura["erros"] + resultado["erros"]
+        except Exception as erro:
+            messagebox.showerror(
+                "Erro na importação", f"Não foi possível importar a planilha.\n\n{erro}",
+                parent=self.root,
+            )
+            return
+        self.consulta.atualizar_condominios()
+        mensagem = f"Telefones importados: {resultado['atualizados']}."
+        if resultado["ignorados"]:
+            mensagem += f" Repetidos ignorados: {resultado['ignorados']}."
+        if erros:
+            detalhes = "\n".join(
+                f"Linha {item['linha']}: {item['erro']}" for item in erros[:10]
+            )
+            if len(erros) > 10:
+                detalhes += f"\n... e mais {len(erros) - 10} erro(s)."
+            mensagem += f"\n\nLinhas não importadas: {len(erros)}.\n{detalhes}"
+        messagebox.showinfo("Importação concluída", mensagem, parent=self.root)
+
+    def salvar_modelo_telefones(self) -> None:
+        destino = filedialog.asksaveasfilename(
+            title="Salvar modelo de importação",
+            defaultextension=".xlsx", initialfile=NOME_MODELO,
+            filetypes=[("Arquivo Excel", "*.xlsx")], parent=self.root,
+        )
+        if not destino:
+            return
+        try:
+            shutil.copyfile(caminho_modelo_importacao(), destino)
+        except Exception as erro:
+            messagebox.showerror(
+                "Erro", f"Não foi possível salvar o modelo.\n\n{erro}",
+                parent=self.root,
+            )
+            return
+        messagebox.showinfo("Modelo salvo", "O modelo foi salvo.", parent=self.root)
 
 
     # =========================================================================
@@ -816,53 +983,7 @@ class SistemaCobrancaApp:
         if not arquivos:
             return
 
-        # =====================================================
-        # LIMPAR EXECUÇÃO ANTERIOR
-        # =====================================================
-
-        # Limpar lista de arquivos selecionados
-        for item in self.lista_arquivos.get_children():
-            self.lista_arquivos.delete(item)
-
-        # Limpar tabela de arquivos processados
-        for item in self.tabela.get_children():
-            self.tabela.delete(item)
-
-        # Limpar dados da execução anterior
-        self.base_mestre = None
-        self.resumo = None
-        self.validacao_estrutura = None
-        self.relatorio = None
-
-        # Zerar indicadores
-        self.label_processados.config(
-            text="PDFs processados: 0"
-        )
-
-        self.label_validos.config(
-            text="PDFs validados: 0"
-        )
-
-        self.label_divergentes.config(
-            text="Arquivos com problema: 0"
-        )
-
-        self.label_registros.config(
-            text="Registros consolidados: 0"
-        )
-
-        # Desabilitar saídas até novo processamento
-        self.botao_excel.config(
-            state="disabled"
-        )
-
-        self.botao_csv.config(
-            state="disabled"
-        )
-
-        self.botao_comunicados.config(
-            state="disabled"
-        )
+        # A seleção não altera os dados atuais nem desabilita as saídas.
 
         self.arquivos_pdf = [
             Path(arquivo)
@@ -951,6 +1072,8 @@ class SistemaCobrancaApp:
 
         bases_validas = []
 
+        fontes_validas = []
+
         registros_relatorio = []
 
         # -----------------------------------------------------
@@ -1029,6 +1152,13 @@ class SistemaCobrancaApp:
                         dados
                     )
 
+                    fontes_validas.append({
+                        "arquivo": caminho_pdf,
+                        "codigo_condominio": cabecalho.get("codigo_condominio", ""),
+                        "condominio": cabecalho.get("condominio", ""),
+                        "dados": dados,
+                    })
+
                 self.tabela.insert(
                     "",
                     "end",
@@ -1094,42 +1224,50 @@ class SistemaCobrancaApp:
         # Consolidar PDFs válidos
         # -----------------------------------------------------
 
+        falha_recarga = False
+
         if bases_validas:
-
-            self.base_mestre = pd.concat(
-                bases_validas,
-                ignore_index=True
-            )
-
-            self.resumo = gerar_resumo(
-                self.base_mestre
-            )
-
-            self.validacao_estrutura = (
-                validar_estrutura(
-                    self.base_mestre
+            try:
+                resultado_carga = registrar_carga(fontes_validas)
+            except Exception as erro:
+                resultado_carga = None
+                estado = "normal" if self.base_mestre is not None else "disabled"
+                for botao in (
+                    self.botao_excel, self.botao_csv, self.botao_comunicados
+                ):
+                    botao.config(state=estado)
+                messagebox.showerror(
+                    "Banco de dados",
+                    (
+                        "Os PDFs foram lidos, mas não foi possível salvar "
+                        "a nova carga. Os dados anteriores continuam disponíveis.\n\n"
+                        f"Detalhes: {erro}"
+                    ),
+                    parent=self.root,
                 )
-            )
-
-            self.botao_excel.config(
-                state="normal"
-            )
-
-            self.botao_csv.config(
-                state="normal"
-            )
-
-            self.botao_comunicados.config(
-                state="normal"
-            )
+            else:
+                try:
+                    self.carregar_base_persistida()
+                except Exception as erro:
+                    falha_recarga = True
+                    estado = "normal" if self.base_mestre is not None else "disabled"
+                    for botao in (
+                        self.botao_excel, self.botao_csv, self.botao_comunicados
+                    ):
+                        botao.config(state=estado)
+                    messagebox.showerror(
+                        "Banco de dados",
+                        (
+                            "A carga foi salva, mas não foi possível atualizar "
+                            "a tela. Feche e abra o aplicativo novamente.\n\n"
+                            f"Detalhes: {erro}"
+                        ),
+                        parent=self.root,
+                    )
 
         else:
-
-            self.base_mestre = None
-
-            self.resumo = None
-
-            self.validacao_estrutura = None
+            resultado_carga = None
+            self.carregar_base_persistida(mostrar_condominios=True)
 
         # -----------------------------------------------------
         # Indicadores
@@ -1205,12 +1343,36 @@ class SistemaCobrancaApp:
         # Status final
         # -----------------------------------------------------
 
-        if total_validos == total_processados:
+        if falha_recarga:
+
+            self.label_status.config(
+                text="Carga salva. Reabra o aplicativo para atualizar a tela."
+            )
+
+        elif resultado_carga is None:
+
+            self.label_status.config(
+                text=(
+                    "Nenhuma carga nova foi salva. "
+                    "Os dados anteriores foram mantidos."
+                )
+            )
+
+        elif resultado_carga["atualizados"] == 0:
+
+            self.label_status.config(
+                text=(
+                    "PDFs já processados anteriormente. "
+                    "Os dados atuais foram mantidos."
+                )
+            )
+
+        elif total_validos == total_processados:
 
             self.label_status.config(
                 text=(
                     "Processamento concluído. "
-                    "Todos os PDFs foram validados."
+                    f"{resultado_carga['atualizados']} condomínio(s) atualizado(s)."
                 )
             )
 
@@ -1218,9 +1380,23 @@ class SistemaCobrancaApp:
 
             self.label_status.config(
                 text=(
-                    "Processamento concluído. "
-                    "Existem arquivos com erro "
-                    "ou divergência."
+                    f"{resultado_carga['atualizados']} condomínio(s) atualizado(s). "
+                    "Os PDFs com erro ou divergência não alteraram o banco."
+                )
+            )
+
+        if self.resumo_contatos is not None:
+
+            texto_atual = self.label_status.cget(
+                "text"
+            )
+
+            self.label_status.config(
+                text=(
+                    f"{texto_atual} "
+                    "Contatos: "
+                    f"{self.resumo_contatos['com_telefone']} com telefone; "
+                    f"{self.resumo_contatos['sem_telefone']} sem telefone."
                 )
             )
 
@@ -1438,9 +1614,56 @@ def main():
 
     root = tk.Tk()
 
-    SistemaCobrancaApp(
-        root
-    )
+    try:
+        if (
+            modo_portatil_ativo()
+            and not caminho_banco().exists()
+            and caminho_banco_local().is_file()
+        ):
+            resposta = messagebox.askyesnocancel(
+                "Banco de dados no pendrive",
+                (
+                    "Encontrei dados deste sistema salvos neste computador. "
+                    "Deseja copiá-los para o pendrive?\n\n"
+                    "Sim: copiar os dados existentes para o pendrive.\n"
+                    "Não: começar com um banco vazio no pendrive.\n"
+                    "Cancelar: fechar o programa sem alterar os dados.\n\n"
+                    "O banco original continuará neste computador."
+                ),
+                parent=root,
+            )
+            if resposta is None:
+                root.destroy()
+                return
+            if resposta:
+                migrar_banco_local_para_portatil()
+        inicializar_banco()
+    except Exception as erro:
+        messagebox.showerror(
+            "Sistema de Cobrança",
+            (
+                "Não foi possível inicializar o banco de dados local.\n\n"
+                "O sistema será encerrado para proteger os dados.\n\n"
+                f"Detalhes: {erro}"
+            ),
+            parent=root,
+        )
+        root.destroy()
+        return
+
+    try:
+        SistemaCobrancaApp(root)
+    except Exception as erro:
+        messagebox.showerror(
+            "Sistema de Cobrança",
+            (
+                "Não foi possível recuperar os dados salvos.\n\n"
+                f"Detalhes: {erro}"
+            ),
+            parent=root,
+        )
+        root.destroy()
+        return
 
     root.mainloop()
 

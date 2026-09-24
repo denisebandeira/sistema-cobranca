@@ -1,0 +1,5 @@
+Sistema de Cobrança — modo portátil.
+
+Deixe este arquivo na mesma pasta do SistemaCobranca.exe.
+O banco de dados será criado na subpasta dados dessa pasta.
+Não apague este arquivo nem a pasta dados ao atualizar o programa.
