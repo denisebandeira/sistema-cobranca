@@ -14,6 +14,8 @@ a = Analysis(
     hiddenimports=[
         'banco_dados', 'cargas_dados',
         'gerador_comunicados', 'modulo_comunicacoes', 'modulo_consultas',
+        'parser_pdf_base_mestre_v1_3_estavel',
+        'parser_pdf_base_mestre_v1_4_telefones',
     ],
     hookspath=[],
     hooksconfig={},

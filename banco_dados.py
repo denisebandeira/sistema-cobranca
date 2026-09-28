@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from contextlib import closing, contextmanager
 from datetime import date, datetime
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -22,7 +24,7 @@ import unicodedata
 NOME_APLICATIVO = "SistemaCobranca"
 NOME_BANCO = "sistema_cobranca.db"
 VARIAVEL_DIRETORIO_DADOS = "SISTEMA_COBRANCA_DATA_DIR"
-VERSAO_ESQUEMA = 4
+VERSAO_ESQUEMA = 5
 MARCADOR_PORTATIL = "MODO_PORTATIL.txt"
 
 
@@ -411,6 +413,17 @@ def inicializar_banco(caminho: str | Path | None = None) -> Path:
 
             CREATE INDEX IF NOT EXISTS idx_lancamentos_carga_vencimento
                 ON lancamentos_carga (data_vencimento);
+
+            CREATE TABLE IF NOT EXISTS situacao_unidades (
+                codigo_condominio TEXT NOT NULL,
+                economia TEXT NOT NULL,
+                ajuizada INTEGER NOT NULL DEFAULT 0 CHECK (ajuizada IN (0, 1)),
+                atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (codigo_condominio, economia)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_situacao_unidades_ajuizada
+                ON situacao_unidades (ajuizada, codigo_condominio);
             """
         )
         if versao_atual < 4:
@@ -435,6 +448,78 @@ def inicializar_banco(caminho: str | Path | None = None) -> Path:
             conexao.execute(f"PRAGMA user_version = {VERSAO_ESQUEMA}")
 
     return arquivo
+
+
+def unidade_ajuizada(
+    codigo_condominio: object, economia: object, *,
+    caminho: str | Path | None = None,
+) -> bool:
+    """Estado persistente da unidade, independente de qualquer carga."""
+
+    codigo = _texto_obrigatorio(codigo_condominio, "codigo_condominio")
+    unidade = _texto_obrigatorio(economia, "economia")
+    with conectar(caminho) as conexao:
+        registro = conexao.execute(
+            "SELECT ajuizada FROM situacao_unidades "
+            "WHERE codigo_condominio = ? AND economia = ?",
+            (codigo, unidade),
+        ).fetchone()
+    return bool(registro["ajuizada"]) if registro else False
+
+
+def listar_unidades_ajuizadas(*, caminho: str | Path | None = None) -> set[tuple[str, str]]:
+    """Chaves das unidades que não podem receber comunicado."""
+
+    with conectar(caminho) as conexao:
+        registros = conexao.execute(
+            "SELECT codigo_condominio, economia FROM situacao_unidades WHERE ajuizada = 1"
+        ).fetchall()
+    return {(linha["codigo_condominio"], linha["economia"]) for linha in registros}
+
+
+def definir_unidade_ajuizada(
+    codigo_condominio: object, economia: object, ajuizada: bool, *,
+    caminho: str | Path | None = None,
+) -> None:
+    """Altera o estado da unidade imediatamente, sem modificar lançamentos."""
+
+    codigo = _texto_obrigatorio(codigo_condominio, "codigo_condominio")
+    unidade = _texto_obrigatorio(economia, "economia")
+    if not isinstance(ajuizada, bool):
+        raise ValueError("A situação ajuizada deve ser SIM ou NÃO.")
+    with conectar(caminho) as conexao:
+        conexao.execute(
+            """INSERT INTO situacao_unidades (codigo_condominio, economia, ajuizada)
+               VALUES (?, ?, ?)
+               ON CONFLICT (codigo_condominio, economia) DO UPDATE SET
+                   ajuizada = excluded.ajuizada,
+                   atualizado_em = CURRENT_TIMESTAMP""",
+            (codigo, unidade, int(ajuizada)),
+        )
+
+
+def definir_unidades_ajuizadas(
+    codigo_condominio: object, economias: Iterable[object], ajuizada: bool, *,
+    caminho: str | Path | None = None,
+) -> int:
+    """Atualiza várias unidades do mesmo condomínio numa única transação."""
+
+    codigo = _texto_obrigatorio(codigo_condominio, "codigo_condominio")
+    if not isinstance(ajuizada, bool):
+        raise ValueError("A situação ajuizada deve ser SIM ou NÃO.")
+    unidades = sorted({_texto_obrigatorio(item, "economia") for item in economias})
+    if not unidades:
+        return 0
+    with conectar(caminho) as conexao:
+        conexao.executemany(
+            """INSERT INTO situacao_unidades (codigo_condominio, economia, ajuizada)
+               VALUES (?, ?, ?)
+               ON CONFLICT (codigo_condominio, economia) DO UPDATE SET
+                   ajuizada = excluded.ajuizada,
+                   atualizado_em = CURRENT_TIMESTAMP""",
+            [(codigo, unidade, int(ajuizada)) for unidade in unidades],
+        )
+    return len(unidades)
 
 
 def salvar_contato(
@@ -700,20 +785,28 @@ def atualizar_contato(
 def _sincronizar_telefone_principal(
     conexao: sqlite3.Connection, contato_id: int
 ) -> None:
-    principal = conexao.execute(
+    candidatos = conexao.execute(
         """
         SELECT valor FROM meios_contato
         WHERE contato_id = ? AND tipo = 'Telefone' AND ativo = 1
-        ORDER BY id DESC LIMIT 1
+        ORDER BY id DESC
         """,
         (contato_id,),
-    ).fetchone()
+    ).fetchall()
+    principal = None
+    for candidato in candidatos:
+        try:
+            principal = normalizar_telefone(candidato["valor"])
+            break
+        except ValueError:
+            # Números locais vindos do PDF não têm DDD confirmado.
+            continue
     conexao.execute(
         """
         UPDATE contatos SET telefone = ?, atualizado_em = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (principal["valor"] if principal else None, contato_id),
+        (principal, contato_id),
     )
 
 
@@ -904,6 +997,457 @@ def importar_telefones(
         "ignorados": ignorados,
         "erros": erros,
     }
+
+
+def registrar_telefones_pdf(
+    registros: Iterable[Mapping[str, object]],
+    *,
+    caminho: str | Path | None = None,
+) -> dict:
+    """Acrescenta telefones lidos do PDF sem substituir dados manuais.
+
+    Números locais são guardados para conferência, mas não se tornam o
+    telefone principal: sem DDD não estão prontos para uso.
+    """
+
+    novos = repetidos = sem_ddd = formatos_pendentes = 0
+    erros = []
+    with conectar(caminho) as conexao:
+        for registro in registros:
+            codigo = _texto_opcional(registro.get("codigo_condominio"))
+            economia = _texto_opcional(registro.get("economia"))
+            nome = _texto_opcional(registro.get("nome_condomino"))
+            numero = re.sub(r"\D", "", str(registro.get("telefone") or ""))
+            pendente = bool(registro.get("ddd_pendente"))
+            formato_pendente = bool(registro.get("formato_pendente"))
+            if not codigo or not economia or not nome:
+                erros.append("Telefone sem identificação completa do devedor.")
+                continue
+            if pendente:
+                if len(numero) not in (8, 9) or numero[0] not in "23456789":
+                    erros.append(f"Telefone local inválido: condomínio {codigo}, economia {economia}.")
+                    continue
+                sem_ddd += 1
+            elif formato_pendente:
+                if len(numero) != 12:
+                    erros.append(f"Telefone para conferência inválido: condomínio {codigo}, economia {economia}.")
+                    continue
+                formatos_pendentes += 1
+            else:
+                try:
+                    numero = normalizar_telefone(numero)
+                except ValueError:
+                    erros.append(f"Telefone inválido: condomínio {codigo}, economia {economia}.")
+                    continue
+
+            contato = conexao.execute(
+                """SELECT id, telefone FROM contatos
+                   WHERE codigo_condominio = ? AND economia = ?
+                     AND condomino = ? COLLATE NOCASE AND ativo = 1""",
+                (codigo, economia, nome),
+            ).fetchone()
+            if contato is None:
+                erros.append(f"Devedor não encontrado: condomínio {codigo}, economia {economia}.")
+                continue
+
+            existente = conexao.execute(
+                """SELECT id FROM meios_contato
+                   WHERE contato_id = ? AND tipo = 'Telefone' AND valor = ?""",
+                (contato["id"], numero),
+            ).fetchone()
+            if existente:
+                repetidos += 1
+                continue
+
+            observacao = (
+                "DDD não informado. Conferir antes de usar."
+                if pendente else
+                "Formato fora do padrão. Conferir antes de usar."
+                if formato_pendente else "Importado do PDF."
+            )
+            if registro.get("observacoes"):
+                observacao = f"{observacao} {str(registro['observacoes']).strip()}"
+            conexao.execute(
+                """INSERT INTO meios_contato
+                       (contato_id, tipo, valor, observacoes)
+                   VALUES (?, 'Telefone', ?, ?)""",
+                (contato["id"], numero, observacao),
+            )
+            if not pendente and not formato_pendente and not contato["telefone"]:
+                conexao.execute(
+                    """UPDATE contatos SET telefone = ?,
+                           atualizado_em = CURRENT_TIMESTAMP WHERE id = ?""",
+                    (numero, contato["id"]),
+                )
+            novos += 1
+
+    return {"novos": novos, "repetidos": repetidos,
+            "sem_ddd": sem_ddd, "formato_pendente": formatos_pendentes,
+            "erros": erros}
+
+
+def recuperar_telefones_de_cargas_antigas(
+    *, caminho: str | Path | None = None
+) -> dict:
+    """Corrige cargas lidas antes do parser com telefones, sem exigir os PDFs.
+
+    A alteração é atômica e precedida de uma cópia do banco. Corrige somente
+    nomes e economias reconhecidos pelas regras de leitura; os valores dos
+    débitos não mudam.
+    """
+
+    from parser_pdf_base_mestre_v1_4_telefones import analisar_registro
+
+    arquivo = _resolver_caminho(caminho)
+    with conectar(arquivo) as conexao:
+        linhas = conexao.execute(
+            """SELECT lc.id, lc.economia, lc.nome_condomino,
+                      cc.id AS carga_condominio_id, cc.codigo_condominio,
+                      cc.condominio, cc.arquivos_json
+               FROM lancamentos_carga lc
+               JOIN cargas_condominio cc ON cc.id = lc.carga_condominio_id
+               ORDER BY lc.id"""
+        ).fetchall()
+        correcoes = []
+        for linha in linhas:
+            registro = analisar_registro(linha["economia"], linha["nome_condomino"])
+            if (
+                registro["telefone"]
+                or registro["economia"] != linha["economia"]
+                or registro["nome_condomino"] != linha["nome_condomino"]
+            ):
+                correcoes.append((linha, registro))
+        if not correcoes:
+            return {"nomes_corrigidos": 0, "telefones_novos": 0,
+                    "sem_ddd": 0, "formato_pendente": 0, "copia": None}
+
+        copia = arquivo.with_name(f"{arquivo.stem}.antes_parser_v5.db")
+        if not copia.exists():
+            with closing(sqlite3.connect(copia)) as destino:
+                conexao.backup(destino)
+
+        grupos_afetados = {}
+        devedores = {}
+        for linha, registro in correcoes:
+            economia_nova = registro["economia"]
+            nome = registro["nome_condomino"]
+            conexao.execute(
+                """UPDATE lancamentos_carga
+                   SET economia = ?, nome_condomino = ? WHERE id = ?""",
+                (economia_nova, nome, linha["id"]),
+            )
+            grupo_id = linha["carga_condominio_id"]
+            revisao = (
+                "telefones-v3"
+                if registro["observacoes"] or registro["ddd_recuperado"]
+                else "telefones-v2"
+                if registro["formato_pendente"] or economia_nova != linha["economia"]
+                else "telefones-v1"
+            )
+            anterior = grupos_afetados.get(grupo_id)
+            ordem = {"telefones-v1": 1, "telefones-v2": 2, "telefones-v3": 3}
+            grupos_afetados[grupo_id] = (
+                linha["arquivos_json"],
+                anterior[1] if anterior and ordem[anterior[1]] > ordem[revisao]
+                else revisao,
+            )
+            chave = (linha["codigo_condominio"], linha["economia"],
+                     linha["nome_condomino"], economia_nova, nome)
+            devedores.setdefault(chave, {
+                "condominio": linha["condominio"], "telefones": set(),
+                "ddd_recuperado": registro["ddd_recuperado"],
+            })
+            if registro["telefone"]:
+                devedores[chave]["telefones"].add((
+                    registro["telefone"], registro["ddd_pendente"],
+                    registro["formato_pendente"], registro["observacoes"],
+                ))
+
+        novos = 0
+        locais = 0
+        formatos = 0
+        for (codigo, economia_antiga, nome_antigo, economia, nome), dados in devedores.items():
+            antigo = conexao.execute(
+                """SELECT * FROM contatos WHERE codigo_condominio = ?
+                   AND economia = ? AND condomino = ? COLLATE NOCASE""",
+                (codigo, economia_antiga, nome_antigo),
+            ).fetchone()
+            atual = conexao.execute(
+                """SELECT * FROM contatos WHERE codigo_condominio = ?
+                   AND economia = ? AND condomino = ? COLLATE NOCASE""",
+                (codigo, economia, nome),
+            ).fetchone()
+            if antigo and not atual:
+                conexao.execute(
+                    """UPDATE contatos SET economia = ?, condomino = ?, ativo = 1,
+                       atualizado_em = CURRENT_TIMESTAMP WHERE id = ?""",
+                    (economia, nome, antigo["id"]),
+                )
+                contato_id = antigo["id"]
+            elif antigo and atual and antigo["id"] != atual["id"]:
+                contato_id = atual["id"]
+                conexao.execute(
+                    """INSERT OR IGNORE INTO meios_contato
+                       (contato_id, tipo, valor, observacoes, ativo)
+                       SELECT ?, tipo, valor, observacoes, ativo
+                       FROM meios_contato WHERE contato_id = ?""",
+                    (contato_id, antigo["id"]),
+                )
+                conexao.execute(
+                    """UPDATE contatos SET telefone = COALESCE(telefone, ?),
+                       observacoes = COALESCE(observacoes, ?), ativo = 1,
+                       atualizado_em = CURRENT_TIMESTAMP WHERE id = ?""",
+                    (antigo["telefone"], antigo["observacoes"], contato_id),
+                )
+                conexao.execute(
+                    "UPDATE historico_comunicacoes SET contato_id = ? WHERE contato_id = ?",
+                    (contato_id, antigo["id"]),
+                )
+                conexao.execute(
+                    "UPDATE contatos SET ativo = 0 WHERE id = ?", (antigo["id"],)
+                )
+            elif atual:
+                contato_id = atual["id"]
+                conexao.execute(
+                    "UPDATE contatos SET ativo = 1 WHERE id = ?", (contato_id,)
+                )
+            else:
+                contato_id = conexao.execute(
+                    """INSERT INTO contatos
+                       (codigo_condominio, economia, condominio, condomino)
+                       VALUES (?, ?, ?, ?)""",
+                    (codigo, economia, dados["condominio"], nome),
+                ).lastrowid
+
+            conexao.execute(
+                """UPDATE historico_comunicacoes
+                   SET economia = ?, condomino = ?
+                   WHERE codigo_condominio = ? AND economia = ?
+                     AND condomino = ? COLLATE NOCASE""",
+                (economia, nome, codigo, economia_antiga, nome_antigo),
+            )
+            if economia_antiga != economia:
+                situacao = conexao.execute(
+                    """SELECT ajuizada FROM situacao_unidades
+                       WHERE codigo_condominio = ? AND economia = ?""",
+                    (codigo, economia_antiga),
+                ).fetchone()
+                if situacao:
+                    conexao.execute(
+                        """INSERT INTO situacao_unidades
+                           (codigo_condominio, economia, ajuizada)
+                           VALUES (?, ?, ?)
+                           ON CONFLICT (codigo_condominio, economia)
+                           DO UPDATE SET ajuizada = MAX(ajuizada, excluded.ajuizada),
+                               atualizado_em = CURRENT_TIMESTAMP""",
+                        (codigo, economia, situacao["ajuizada"]),
+                    )
+            if dados["ddd_recuperado"]:
+                locais_antigos = conexao.execute(
+                    """SELECT valor FROM meios_contato
+                       WHERE contato_id = ? AND tipo = 'Telefone' AND ativo = 1
+                         AND (observacoes LIKE 'Importado do PDF%'
+                              OR observacoes LIKE 'DDD não informado.%'
+                              OR observacoes LIKE 'Formato fora do padrão.%')""",
+                    (contato_id,),
+                ).fetchall()
+                for meio_local in locais_antigos:
+                    local = meio_local["valor"]
+                    if len(local) in (8, 9):
+                        completo = f"{dados['ddd_recuperado']}{local}"
+                        try:
+                            normalizar_telefone(completo)
+                        except ValueError:
+                            continue
+                        dados["telefones"].add((completo, False, False, None))
+
+            for numero, pendente, formato, nota_extra in dados["telefones"]:
+                if pendente:
+                    locais += 1
+                if formato:
+                    formatos += 1
+                existente = conexao.execute(
+                    """SELECT id FROM meios_contato WHERE contato_id = ?
+                       AND tipo = 'Telefone' AND valor = ?""",
+                    (contato_id, numero),
+                ).fetchone()
+                if existente:
+                    if nota_extra:
+                        conexao.execute(
+                            """UPDATE meios_contato SET observacoes = ?,
+                               atualizado_em = CURRENT_TIMESTAMP
+                               WHERE id = ? AND (observacoes IS NULL
+                                   OR TRIM(observacoes) = ''
+                                   OR observacoes = 'Importado do PDF.')""",
+                            (f"Importado do PDF. {nota_extra}", existente["id"]),
+                        )
+                    continue
+                observacao = (
+                    "DDD não informado. Conferir antes de usar."
+                    if pendente else
+                    "Formato fora do padrão. Conferir antes de usar."
+                    if formato else "Importado do PDF."
+                )
+                if nota_extra:
+                    observacao = f"{observacao} {nota_extra}"
+                local_anterior = None
+                if dados["ddd_recuperado"] and numero.startswith(dados["ddd_recuperado"]):
+                    local_anterior = conexao.execute(
+                        """SELECT id FROM meios_contato
+                           WHERE contato_id = ? AND tipo = 'Telefone'
+                             AND valor = ? AND ativo = 1
+                             AND (observacoes LIKE 'Importado do PDF%'
+                                  OR observacoes LIKE 'DDD não informado.%'
+                                  OR observacoes LIKE 'Formato fora do padrão.%')""",
+                        (contato_id, numero[len(dados["ddd_recuperado"]):]),
+                    ).fetchone()
+                if local_anterior:
+                    conexao.execute(
+                        """UPDATE meios_contato SET valor = ?, observacoes = ?,
+                           atualizado_em = CURRENT_TIMESTAMP WHERE id = ?""",
+                        (numero, observacao, local_anterior["id"]),
+                    )
+                else:
+                    conexao.execute(
+                        """INSERT INTO meios_contato
+                           (contato_id, tipo, valor, observacoes)
+                           VALUES (?, 'Telefone', ?, ?)""",
+                        (contato_id, numero, observacao),
+                    )
+                if not pendente and not formato:
+                    conexao.execute(
+                        """UPDATE contatos SET telefone = ?,
+                           atualizado_em = CURRENT_TIMESTAMP
+                           WHERE id = ? AND telefone IS NULL""",
+                        (numero, contato_id),
+                    )
+                novos += 1
+
+        # Evita que a mesma imagem PDF gere outra carga apenas por ter sido
+        # lida anteriormente pelo parser antigo.
+        for grupo_id, (arquivos_json, revisao) in grupos_afetados.items():
+            hashes = sorted(item["sha256"] for item in json.loads(arquivos_json))
+            hashes.append(revisao)
+            digest = hashlib.sha256("\n".join(hashes).encode("ascii")).hexdigest()
+            conexao.execute(
+                """UPDATE cargas_condominio SET conteudo_sha256 = ?
+                   WHERE id = ?""",
+                (digest, grupo_id),
+            )
+
+    return {"nomes_corrigidos": len(correcoes), "telefones_novos": novos,
+            "sem_ddd": locais, "formato_pendente": formatos,
+            "copia": str(copia)}
+
+
+def corrigir_identidade_terezinha_v5(
+    *, caminho: str | Path | None = None
+) -> dict:
+    """Desfaz a atribuição indevida da carga GARDEN 2A (1) ao José.
+
+    A carga anterior, na qual José já constava, permanece intocada. O reparo
+    é específico para o PDF e os dois títulos afetados pelo parser v5.
+    """
+
+    arquivo = _resolver_caminho(caminho)
+    sha_pdf = "442ce2fd05cfedb32aee6e17bf479dd76a0d25fcb8317e07a14582add0427c7a"
+    numeros = ("0000026477829", "0000026489930")
+    with conectar(arquivo) as conexao:
+        linhas = conexao.execute(
+            """SELECT lc.id, cc.condominio, cc.arquivos_json
+               FROM lancamentos_carga lc
+               JOIN cargas_condominio cc ON cc.id = lc.carga_condominio_id
+               WHERE cc.codigo_condominio = '00147'
+                 AND lc.economia = '108 (01)'
+                 AND lc.nome_condomino = 'JOSE DE OLIVEIRA'
+                 AND lc.nosso_numero IN (?, ?)""",
+            numeros,
+        ).fetchall()
+        afetadas = [
+            linha for linha in linhas
+            if any(item.get("sha256") == sha_pdf
+                   for item in json.loads(linha["arquivos_json"]))
+        ]
+        if not afetadas:
+            return {"nomes_corrigidos": 0, "copia": None}
+
+        copia = arquivo.with_name(f"{arquivo.stem}.antes_parser_v6.db")
+        if not copia.exists():
+            with closing(sqlite3.connect(copia)) as destino:
+                conexao.backup(destino)
+
+        nome = "Terezinha: Procuradora"
+        telefone = "5192287193"
+        for linha in afetadas:
+            conexao.execute(
+                "UPDATE lancamentos_carga SET nome_condomino = ? WHERE id = ?",
+                (nome, linha["id"]),
+            )
+
+        representante = conexao.execute(
+            """SELECT id FROM contatos WHERE codigo_condominio = '00147'
+               AND economia = '108 (01)' AND condomino = ? COLLATE NOCASE""",
+            (nome,),
+        ).fetchone()
+        bruto = conexao.execute(
+            """SELECT id FROM contatos WHERE codigo_condominio = '00147'
+               AND economia = '108 (01)'
+               AND condomino = ? COLLATE NOCASE""",
+            ("Terezinha: Procuradora (51)9228-7193-JOSE DE OLIVEIRA",),
+        ).fetchone()
+        if representante:
+            contato_id = representante["id"]
+        elif bruto:
+            contato_id = bruto["id"]
+            conexao.execute(
+                """UPDATE contatos SET condomino = ?, ativo = 1,
+                   telefone = COALESCE(telefone, ?),
+                   atualizado_em = CURRENT_TIMESTAMP WHERE id = ?""",
+                (nome, telefone, contato_id),
+            )
+        else:
+            contato_id = conexao.execute(
+                """INSERT INTO contatos
+                   (codigo_condominio, economia, condominio, condomino, telefone)
+                   VALUES ('00147', '108 (01)', ?, ?, ?)""",
+                (afetadas[0]["condominio"], nome, telefone),
+            ).lastrowid
+        conexao.execute(
+            """UPDATE contatos SET ativo = 1, telefone = COALESCE(telefone, ?),
+               atualizado_em = CURRENT_TIMESTAMP WHERE id = ?""",
+            (telefone, contato_id),
+        )
+        conexao.execute(
+            """INSERT OR IGNORE INTO meios_contato
+               (contato_id, tipo, valor, observacoes)
+               VALUES (?, 'Telefone', ?, 'Importado do PDF; Terezinha (procuradora).')""",
+            (contato_id, telefone),
+        )
+
+        # No v5 este telefone foi copiado para o José. Removemos somente a
+        # cópia identificada como importação da procuradora, nunca os meios
+        # cadastrados manualmente nem o contato histórico de José.
+        jose = conexao.execute(
+            """SELECT id, telefone FROM contatos WHERE codigo_condominio = '00147'
+               AND economia = '108 (01)' AND condomino = 'JOSE DE OLIVEIRA'"""
+        ).fetchone()
+        if jose:
+            meios_v5 = conexao.execute(
+                """SELECT id FROM meios_contato WHERE contato_id = ?
+                   AND tipo = 'Telefone' AND valor = ?
+                   AND observacoes LIKE 'Importado do PDF.%Terezinha (procuradora)%'""",
+                (jose["id"], telefone),
+            ).fetchall()
+            for meio in meios_v5:
+                conexao.execute(
+                    "UPDATE meios_contato SET ativo = 0 WHERE id = ?", (meio["id"],)
+                )
+            if meios_v5 and jose["telefone"] == telefone:
+                conexao.execute(
+                    "UPDATE contatos SET telefone = NULL WHERE id = ?", (jose["id"],)
+                )
+
+    return {"nomes_corrigidos": len(afetadas), "copia": str(copia)}
 
 
 def registrar_comunicacao(

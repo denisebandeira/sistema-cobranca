@@ -64,6 +64,7 @@ def gerar_comunicados_excel(
     *,
     data_referencia: date | datetime | None = None,
     taxa_honorarios: float = TAXA_HONORARIOS_PADRAO,
+    unidades_ajuizadas: set[tuple[str, str]] | None = None,
 ) -> bytes:
     """Retorna um XLSX com um comunicado por unidade/condômino.
 
@@ -76,6 +77,7 @@ def gerar_comunicados_excel(
         base_mestre,
         data_referencia=data_referencia,
         taxa_honorarios=taxa_honorarios,
+        unidades_ajuizadas=unidades_ajuizadas,
     )
     return _gerar_xlsx_preparado(
         base,
@@ -93,6 +95,7 @@ def gerar_comunicado_individual_excel(
     nome_condomino: str,
     data_referencia: date | datetime | None = None,
     taxa_honorarios: float = TAXA_HONORARIOS_PADRAO,
+    unidades_ajuizadas: set[tuple[str, str]] | None = None,
 ) -> bytes:
     """Gera uma unica aba, usando as mesmas regras do pacote por condominio."""
 
@@ -104,11 +107,14 @@ def gerar_comunicado_individual_excel(
     ]
     if selecionada.empty:
         raise ValueError("O devedor selecionado não consta nesta carga.")
+    if (str(codigo_condominio).strip(), str(economia).strip()) in (unidades_ajuizadas or set()):
+        raise ValueError("A unidade está ajuizada e não pode receber comunicado.")
     return gerar_comunicados_excel(
         selecionada,
         modelo,
         data_referencia=data_referencia,
         taxa_honorarios=taxa_honorarios,
+        unidades_ajuizadas=unidades_ajuizadas,
     )
 
 
@@ -118,6 +124,7 @@ def gerar_comunicados_por_condominio(
     *,
     data_referencia: date | datetime | None = None,
     taxa_honorarios: float = TAXA_HONORARIOS_PADRAO,
+    unidades_ajuizadas: set[tuple[str, str]] | None = None,
 ) -> dict[str, bytes]:
     """Retorna um XLSX separado para cada condomínio da Base Mestre."""
 
@@ -125,6 +132,7 @@ def gerar_comunicados_por_condominio(
         base_mestre,
         data_referencia=data_referencia,
         taxa_honorarios=taxa_honorarios,
+        unidades_ajuizadas=unidades_ajuizadas,
     )
     arquivos: dict[str, bytes] = {}
     modelo_reutilizavel = _conteudo_modelo(modelo)
@@ -151,6 +159,7 @@ def gerar_pacote_comunicados_zip(
     *,
     data_referencia: date | datetime | None = None,
     taxa_honorarios: float = TAXA_HONORARIOS_PADRAO,
+    unidades_ajuizadas: set[tuple[str, str]] | None = None,
 ) -> bytes:
     """Cria um ZIP contendo um arquivo Excel para cada condomínio."""
 
@@ -159,6 +168,7 @@ def gerar_pacote_comunicados_zip(
         modelo,
         data_referencia=data_referencia,
         taxa_honorarios=taxa_honorarios,
+        unidades_ajuizadas=unidades_ajuizadas,
     )
     saida = BytesIO()
     with ZipFile(saida, mode="w", compression=ZIP_DEFLATED) as pacote:
@@ -221,11 +231,17 @@ def _filtrar_base_elegivel(
     *,
     data_referencia: date | datetime | None,
     taxa_honorarios: float,
+    unidades_ajuizadas: set[tuple[str, str]] | None = None,
 ) -> pd.DataFrame:
     if not 0 <= taxa_honorarios <= 1:
         raise ValueError("A taxa de honorários deve estar entre 0 e 1.")
 
     base = _preparar_base(base_mestre)
+    if unidades_ajuizadas:
+        chaves = pd.MultiIndex.from_frame(base[["codigo_condominio", "economia"]])
+        base = base.loc[~chaves.isin(unidades_ajuizadas)].copy()
+    if base.empty:
+        raise ValueError("Não há unidades não ajuizadas para gerar comunicados.")
     referencia = _normalizar_data_referencia(data_referencia)
     limite = pd.Timestamp(referencia - timedelta(days=30))
     base = base.loc[base["data_vencimento"] < limite].copy()

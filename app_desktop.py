@@ -21,8 +21,11 @@ from tkinter import (
 import pandas as pd
 
 from banco_dados import (
-    caminho_banco, caminho_banco_local, importar_telefones, inicializar_banco,
-    migrar_banco_local_para_portatil, modo_portatil_ativo, sincronizar_devedores,
+    caminho_banco, caminho_banco_local, corrigir_identidade_terezinha_v5,
+    importar_telefones, inicializar_banco,
+    listar_unidades_ajuizadas, migrar_banco_local_para_portatil,
+    modo_portatil_ativo, recuperar_telefones_de_cargas_antigas,
+    registrar_telefones_pdf, sincronizar_devedores,
 )
 
 from openpyxl import load_workbook
@@ -35,7 +38,7 @@ from openpyxl.styles import (
 )
 from openpyxl.utils import get_column_letter
 
-from parser_pdf_base_mestre_v1_3_estavel import (
+from parser_pdf_base_mestre_v1_4_telefones import (
     processar_pdf,
     gerar_resumo,
     validar_estrutura
@@ -368,7 +371,7 @@ class SistemaCobrancaApp:
         linha_titulo = ttk.Frame(barra)
         linha_titulo.pack(fill="x")
         ttk.Label(
-            linha_titulo, text="Sistema de Cobrança — versão de teste",
+            linha_titulo, text="Sistema de Cobrança — teste · parser v6",
             font=("Arial", 16, "bold"),
         ).pack(side="left")
         self.botao_encerrar = ttk.Button(
@@ -378,10 +381,62 @@ class SistemaCobrancaApp:
 
         self.abas_principais = ttk.Notebook(root)
         self.abas_principais.grid(row=1, column=0, sticky="nsew")
-        self.tela_consulta = ttk.Frame(self.abas_principais)
-        self.tela_importacao = ttk.Frame(self.abas_principais)
-        self.abas_principais.add(self.tela_importacao, text="Importar / salvar")
-        self.abas_principais.add(self.tela_consulta, text="Condomínios / devedores")
+        pagina_consulta = ttk.Frame(self.abas_principais)
+        canvas_consulta = tk.Canvas(
+            pagina_consulta, highlightthickness=0, borderwidth=0
+        )
+        barra_consulta = ttk.Scrollbar(
+            pagina_consulta, orient="vertical", command=canvas_consulta.yview
+        )
+        canvas_consulta.configure(yscrollcommand=barra_consulta.set)
+        canvas_consulta.pack(side="left", fill="both", expand=True)
+        barra_consulta.pack(side="right", fill="y")
+        self.tela_consulta = ttk.Frame(canvas_consulta)
+        conteudo_consulta = canvas_consulta.create_window(
+            (0, 0), window=self.tela_consulta, anchor="nw"
+        )
+        self.tela_consulta.bind(
+            "<Configure>",
+            lambda _evento: canvas_consulta.configure(
+                scrollregion=canvas_consulta.bbox("all")
+            ),
+        )
+        canvas_consulta.bind(
+            "<Configure>",
+            lambda evento: canvas_consulta.itemconfigure(
+                conteudo_consulta, width=evento.width,
+                height=max(self.tela_consulta.winfo_reqheight(), evento.height),
+            ),
+        )
+        pagina_importacao = ttk.Frame(self.abas_principais)
+        canvas_importacao = tk.Canvas(
+            pagina_importacao, highlightthickness=0, borderwidth=0
+        )
+        barra_importacao = ttk.Scrollbar(
+            pagina_importacao, orient="vertical", command=canvas_importacao.yview
+        )
+        canvas_importacao.configure(yscrollcommand=barra_importacao.set)
+        canvas_importacao.pack(side="left", fill="both", expand=True)
+        barra_importacao.pack(side="right", fill="y")
+        self.tela_importacao = ttk.Frame(canvas_importacao)
+        conteudo_importacao = canvas_importacao.create_window(
+            (0, 0), window=self.tela_importacao, anchor="nw"
+        )
+        self.tela_importacao.bind(
+            "<Configure>",
+            lambda _evento: canvas_importacao.configure(
+                scrollregion=canvas_importacao.bbox("all")
+            ),
+        )
+        canvas_importacao.bind(
+            "<Configure>",
+            lambda evento: canvas_importacao.itemconfigure(
+                conteudo_importacao, width=evento.width,
+                height=max(self.tela_importacao.winfo_reqheight(), evento.height),
+            ),
+        )
+        self.abas_principais.add(pagina_importacao, text="Importar / salvar")
+        self.abas_principais.add(pagina_consulta, text="Condomínios / devedores")
         self.tela_importacao.columnconfigure(0, weight=1)
         self.tela_importacao.rowconfigure(3, weight=1, minsize=90)
 
@@ -842,9 +897,13 @@ class SistemaCobrancaApp:
                 pass
 
 
-    def carregar_base_persistida(self, *, mostrar_condominios=False):
+    def carregar_base_persistida(
+        self, *, mostrar_condominios=False, telefones_pdf=()
+    ):
         """Restaura a visao atual sem exigir nova importacao dos PDFs."""
 
+        reparo_pdf = recuperar_telefones_de_cargas_antigas()
+        corrigir_identidade_terezinha_v5()
         base = carregar_base_atual()
         self.base_mestre = base if not base.empty else None
 
@@ -857,6 +916,9 @@ class SistemaCobrancaApp:
             self.resumo = gerar_resumo(self.base_mestre)
             self.validacao_estrutura = validar_estrutura(self.base_mestre)
             contatos = sincronizar_devedores(self.resumo.to_dict(orient="records"))
+            if telefones_pdf:
+                self.resultado_telefones_pdf = registrar_telefones_pdf(telefones_pdf)
+                contatos = sincronizar_devedores(self.resumo.to_dict(orient="records"))
             self.devedores_com_contatos = pd.DataFrame(contatos)
             com_telefone = sum(bool(contato["telefone"]) for contato in contatos)
             self.resumo_contatos = {
@@ -900,6 +962,16 @@ class SistemaCobrancaApp:
                         f"Última atualização: {max(datas)[:16].replace('T', ' ')}."
                     )
                 )
+        if reparo_pdf["nomes_corrigidos"]:
+            self.label_status.config(
+                text=(
+                    f"Dados anteriores corrigidos: {reparo_pdf['nomes_corrigidos']} "
+                    f"nome(s), {reparo_pdf['telefones_novos']} telefone(s) "
+                    "identificado(s) nos PDFs. "
+                    f"Conferir: {reparo_pdf['sem_ddd']} sem DDD e "
+                    f"{reparo_pdf['formato_pendente']} com formato atípico."
+                )
+            )
         condominios_atuais = listar_condominios_atuais()
         if condominios_atuais:
             data_mais_recente = max(item["criada_em"] for item in condominios_atuais)
@@ -1157,6 +1229,8 @@ class SistemaCobrancaApp:
                         "codigo_condominio": cabecalho.get("codigo_condominio", ""),
                         "condominio": cabecalho.get("condominio", ""),
                         "dados": dados,
+                        "telefones_pdf": resultado["telefones_pdf"],
+                        "parser_revisao": resultado["parser_revisao"],
                     })
 
                 self.tabela.insert(
@@ -1225,6 +1299,7 @@ class SistemaCobrancaApp:
         # -----------------------------------------------------
 
         falha_recarga = False
+        self.resultado_telefones_pdf = None
 
         if bases_validas:
             try:
@@ -1247,7 +1322,12 @@ class SistemaCobrancaApp:
                 )
             else:
                 try:
-                    self.carregar_base_persistida()
+                    telefones_pdf = [
+                        telefone
+                        for fonte in fontes_validas
+                        for telefone in fonte.get("telefones_pdf", ())
+                    ]
+                    self.carregar_base_persistida(telefones_pdf=telefones_pdf)
                 except Exception as erro:
                     falha_recarga = True
                     estado = "normal" if self.base_mestre is not None else "disabled"
@@ -1400,6 +1480,22 @@ class SistemaCobrancaApp:
                 )
             )
 
+        if self.resultado_telefones_pdf is not None:
+            importados = self.resultado_telefones_pdf
+            self.label_status.config(text=(
+                f"{self.label_status.cget('text')} "
+                f"PDF: {importados['novos']} telefone(s) novo(s); "
+                f"{importados['sem_ddd']} sem DDD e "
+                f"{importados['formato_pendente']} com formato atípico para conferir."
+            ))
+            if importados["erros"]:
+                messagebox.showwarning(
+                    "Telefones do PDF",
+                    f"{len(importados['erros'])} telefone(s) não foram associados "
+                    "a um devedor. Os demais dados foram preservados.",
+                    parent=self.root,
+                )
+
 
     # =========================================================================
     # SALVAR EXCEL
@@ -1509,6 +1605,7 @@ class SistemaCobrancaApp:
             conteudo = gerar_pacote_comunicados_zip(
                 self.base_mestre,
                 caminho_modelo_padrao(),
+                unidades_ajuizadas=listar_unidades_ajuizadas(),
             )
 
             Path(arquivo).write_bytes(conteudo)

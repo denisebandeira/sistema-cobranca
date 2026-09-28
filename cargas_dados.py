@@ -83,11 +83,13 @@ def _preparar_fontes(fontes: Iterable[Mapping]) -> dict[str, dict]:
 
         grupo = agrupadas.setdefault(
             codigo,
-            {"condominio": nome, "arquivos": [], "linhas": []},
+            {"condominio": nome, "arquivos": [], "linhas": [], "revisoes": set()},
         )
         if grupo["condominio"] != nome:
             raise ValueError(f"Nomes diferentes para o condomínio {codigo}.")
         grupo["arquivos"].append({"nome": arquivo.name, "sha256": digest})
+        if fonte.get("parser_revisao"):
+            grupo["revisoes"].add(_texto(fonte["parser_revisao"]))
 
         for registro in dados.to_dict(orient="records"):
             if _texto(registro["codigo_condominio"]) != codigo:
@@ -107,6 +109,10 @@ def _preparar_fontes(fontes: Iterable[Mapping]) -> dict[str, dict]:
 
     for grupo in agrupadas.values():
         hashes = sorted(arquivo["sha256"] for arquivo in grupo["arquivos"])
+        # A mesma imagem PDF pode produzir nomes limpos após a atualização do
+        # parser. Nesse caso ela precisa substituir a carga antiga uma vez.
+        if grupo["revisoes"]:
+            hashes.extend(sorted(grupo["revisoes"]))
         grupo["conteudo_sha256"] = hashlib.sha256(
             "\n".join(hashes).encode("ascii")
         ).hexdigest()

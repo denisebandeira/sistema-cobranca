@@ -5,17 +5,21 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 import re
 
 import pandas as pd
 
 from banco_dados import (
-    listar_contatos,
+    desativar_meio_contato,
+    definir_unidade_ajuizada, definir_unidades_ajuizadas,
+    listar_contatos, listar_unidades_ajuizadas,
     listar_historico_comunicacoes,
     listar_meios_contato,
     registrar_comunicacao,
     salvar_contato,
     salvar_meio_contato,
+    unidade_ajuizada,
 )
 from gerador_comunicados import (
     caminho_modelo_padrao,
@@ -38,6 +42,61 @@ def _moeda(valor: object) -> str:
 
 def _data_carga(valor: str) -> str:
     return valor[:16].replace("T", " ")
+
+
+def _ler_criterios_ajuizamento(
+    debitos: str, valor: str,
+) -> tuple[int | None, Decimal | None]:
+    """Interpreta os limites informados em formato brasileiro."""
+
+    debitos = debitos.strip()
+    valor = valor.strip().removeprefix("R$").strip()
+    if not debitos and not valor:
+        raise ValueError("Informe ao menos um critério para ver as candidatas.")
+    if debitos and not re.fullmatch(r"\d+", debitos):
+        raise ValueError("Informe um número inteiro de débitos, sem sinal.")
+    limite_debitos = int(debitos) if debitos else None
+    limite_valor = None
+    if valor:
+        numero_br = re.fullmatch(
+            r"(?:\d+|\d{1,3}(?:\.\d{3})+)(?:,\d{1,2})?", valor
+        )
+        decimal_ponto = re.fullmatch(r"\d+\.\d{1,2}", valor)
+        if not (numero_br or decimal_ponto):
+            raise ValueError("Informe o valor em reais, como 1000,00 ou 1.000,00.")
+        normalizado = (
+            valor.replace(".", "").replace(",", ".")
+            if numero_br else valor
+        )
+        try:
+            limite_valor = Decimal(normalizado)
+        except InvalidOperation as erro:
+            raise ValueError("O valor corrigido informado é inválido.") from erro
+    return limite_debitos, limite_valor
+
+
+def _candidatas_por_criterios(
+    resumo: pd.DataFrame,
+    *,
+    limite_debitos: int | None,
+    limite_valor: Decimal | None,
+    ajuizadas: set[str],
+) -> set[str]:
+    """Une os critérios (OU) e devolve economias únicas ainda não ajuizadas."""
+
+    candidatas = set()
+    for _, linha in resumo.iterrows():
+        economia = str(linha["economia"])
+        if economia in ajuizadas:
+            continue
+        atende_debitos = limite_debitos is not None and int(linha["count"]) > limite_debitos
+        atende_valor = (
+            limite_valor is not None
+            and Decimal(str(linha["sum"])) > limite_valor
+        )
+        if atende_debitos or atende_valor:
+            candidatas.add(economia)
+    return candidatas
 
 
 def _criar_tabela(parent, colunas, titulos, larguras, *, altura=8):
@@ -90,11 +149,19 @@ class JanelaConsultas:
         self.contato_selecionado = None
         self.meio_edicao_id = None
         self.meios_por_id = {}
+        self.mostrar_apenas_nao_ajuizadas = tk.BooleanVar(value=False)
+        self.ajuizada_sim = tk.BooleanVar(value=False)
+        self.ajuizada_nao = tk.BooleanVar(value=True)
+        self.limite_debitos = tk.StringVar()
+        self.limite_valor = tk.StringVar()
+        self.candidatas_ajuizamento: set[str] = set()
+        self.previa_ajuizamento_ativa = False
+        self.resumo_devedores = pd.DataFrame()
 
-        topo = ttk.Frame(self.janela, padding=(16, 14, 16, 10))
+        topo = ttk.Frame(self.janela, padding=(12, 6, 12, 5))
         topo.pack(fill="x")
         ttk.Label(
-            topo, text="Condomínios e devedores", font=("Arial", 18, "bold"),
+            topo, text="Consulta", font=("Arial", 12, "bold"),
         ).pack(side="left")
         ttk.Button(
             topo, text="Atualizar consulta", command=self.atualizar_condominios,
@@ -103,10 +170,12 @@ class JanelaConsultas:
         # As duas colunas compartilham as mesmas linhas. Assim, contatos e
         # ficha do devedor sempre começam exatamente na mesma altura.
         corpo = ttk.Frame(self.janela)
-        corpo.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        corpo.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         corpo.columnconfigure(0, weight=2, minsize=340)
         corpo.columnconfigure(1, weight=3, minsize=520)
-        corpo.rowconfigure(1, weight=1)
+        # A lista de devedores fica compacta; o espaço extra vai para a ficha
+        # e para os contatos, mantendo os dois painéis inferiores alinhados.
+        corpo.rowconfigure(1, weight=0)
         corpo.rowconfigure(2, weight=1)
 
         quadro_condominios = ttk.LabelFrame(
@@ -128,7 +197,7 @@ class JanelaConsultas:
             ("codigo", "nome", "data"),
             {"codigo": "Código", "nome": "Condomínio", "data": "Última carga"},
             {"codigo": 70, "nome": 210, "data": 135},
-            altura=8,
+            altura=7,
         )
         quadro.pack(fill="both", expand=True)
         self.tabela_condominios.bind(
@@ -144,8 +213,8 @@ class JanelaConsultas:
             quadro_contatos,
             ("tipo", "valor", "observacoes"),
             {"tipo": "Tipo", "valor": "Telefone / e-mail", "observacoes": "Obs."},
-            {"tipo": 75, "valor": 155, "observacoes": 105},
-            altura=5,
+            {"tipo": 75, "valor": 155, "observacoes": 390},
+            altura=4,
         )
         quadro.pack(fill="both", expand=True)
         self.tabela_meios.bind("<<TreeviewSelect>>", self.ao_selecionar_meio)
@@ -177,6 +246,11 @@ class JanelaConsultas:
             state="disabled",
         )
         self.botao_salvar_meio.pack(side="left")
+        self.botao_excluir_meio = ttk.Button(
+            botoes_meio, text="Excluir selecionado", command=self.excluir_meio,
+            state="disabled",
+        )
+        self.botao_excluir_meio.pack(side="left", padx=(5, 0))
 
         escolha = ttk.LabelFrame(corpo, text="2. Carga do condomínio", padding=8)
         escolha.grid(row=0, column=1, sticky="ew", pady=(0, 8))
@@ -188,28 +262,82 @@ class JanelaConsultas:
             escolha, text="Selecione um condomínio.", wraplength=700,
         )
         self.label_arquivos.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            escolha, text="Mostrar somente unidades não ajuizadas",
+            variable=self.mostrar_apenas_nao_ajuizadas,
+            command=self.atualizar_lista_devedores,
+        ).grid(row=2, column=0, sticky="w", pady=(5, 0))
 
         quadro_devedores = ttk.LabelFrame(
             corpo, text="3. Devedores da carga selecionada", padding=8
         )
         quadro_devedores.grid(row=1, column=1, sticky="nsew", pady=(0, 8))
+        ttk.Label(
+            quadro_devedores,
+            text="Ajuizada: clique na caixa da linha para alternar NÃO/SIM. Salva na hora.",
+            wraplength=600,
+        ).pack(anchor="w", pady=(0, 4))
+        self.botao_exibir_criterios = ttk.Button(
+            quadro_devedores, text="Marcação em lote ▸",
+            command=self.alternar_painel_lote,
+        )
+        self.botao_exibir_criterios.pack(anchor="w", pady=(0, 4))
+        self.painel_lote = ttk.Frame(quadro_devedores)
+        self.label_previa_ajuizamento = ttk.Label(
+            self.painel_lote,
+            text="Informe um critério para ver unidades ainda não ajuizadas.",
+            wraplength=600,
+        )
+        self.label_previa_ajuizamento.pack(anchor="w", pady=(0, 4))
+        criterios = ttk.Frame(self.painel_lote)
+        criterios.pack(fill="x", pady=(0, 4))
+        ttk.Label(criterios, text="Débitos >").grid(row=0, column=0, sticky="w")
+        ttk.Entry(criterios, textvariable=self.limite_debitos, width=6).grid(
+            row=0, column=1, sticky="w", padx=(4, 10)
+        )
+        ttk.Label(criterios, text="ou total corrigido > R$").grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Entry(criterios, textvariable=self.limite_valor, width=12).grid(
+            row=0, column=3, sticky="w", padx=(4, 8)
+        )
+        ttk.Button(
+            criterios, text="Ver candidatas", command=self.ver_candidatas_ajuizamento,
+        ).grid(row=0, column=4, sticky="w")
+        previa = ttk.Frame(self.painel_lote)
+        previa.pack(fill="x", pady=(0, 4))
+        self.botao_marcar_lote = ttk.Button(
+            previa, text="Marcar candidatas como SIM",
+            command=self.marcar_candidatas_ajuizadas, state="disabled",
+        )
+        self.botao_marcar_lote.pack(side="right")
+        self.botao_limpar_selecao = ttk.Button(
+            previa, text="Limpar seleção",
+            command=self.limpar_selecao_ajuizamento, state="disabled",
+        )
+        self.botao_limpar_selecao.pack(side="right", padx=(0, 6))
         quadro, self.tabela_devedores = _criar_tabela(
             quadro_devedores,
-            ("economia", "nome", "parcelas", "total"),
+            ("economia", "nome", "parcelas", "total", "ajuizada"),
             {
                 "economia": "Economia", "nome": "Condômino",
                 "parcelas": "Débitos", "total": "Total corrigido",
+                "ajuizada": "Ajuizada",
             },
             {
                 "economia": 95, "nome": 250, "parcelas": 65,
-                "total": 115,
+                "total": 115, "ajuizada": 90,
             },
-            altura=9,
+            altura=7,
         )
+        self.quadro_tabela_devedores = quadro
         quadro.pack(fill="both", expand=True)
+        self.limite_debitos.trace_add("write", self._limpar_previa_ajuizamento)
+        self.limite_valor.trace_add("write", self._limpar_previa_ajuizamento)
         self.tabela_devedores.bind(
             "<<TreeviewSelect>>", self.ao_selecionar_devedor
         )
+        self.tabela_devedores.bind("<ButtonRelease-1>", self.alternar_ajuizada_na_lista)
 
         detalhes = ttk.LabelFrame(corpo, text="4. Ficha do devedor", padding=8)
         detalhes.grid(row=2, column=1, sticky="nsew")
@@ -220,8 +348,27 @@ class JanelaConsultas:
         )
         self.label_devedor.grid(row=0, column=0, sticky="w", pady=(0, 5))
 
+        situacao_unidade = ttk.Frame(detalhes)
+        situacao_unidade.grid(row=1, column=0, sticky="w", pady=(0, 5))
+        ttk.Label(situacao_unidade, text="Unidade ajuizada:").pack(side="left")
+        self.check_ajuizada_sim = ttk.Checkbutton(
+            situacao_unidade, text="SIM", variable=self.ajuizada_sim,
+            command=lambda: self._selecionar_ajuizada_ficha(True),
+        )
+        self.check_ajuizada_sim.pack(side="left", padx=(8, 0))
+        self.check_ajuizada_nao = ttk.Checkbutton(
+            situacao_unidade, text="NÃO", variable=self.ajuizada_nao,
+            command=lambda: self._selecionar_ajuizada_ficha(False),
+        )
+        self.check_ajuizada_nao.pack(side="left", padx=(8, 0))
+        self.botao_salvar_ajuizada = ttk.Button(
+            situacao_unidade, text="Salvar situação",
+            command=self.salvar_ajuizada_ficha, state="disabled",
+        )
+        self.botao_salvar_ajuizada.pack(side="left", padx=(12, 0))
+
         acoes = ttk.Frame(detalhes)
-        acoes.grid(row=1, column=0, sticky="w")
+        acoes.grid(row=2, column=0, sticky="w")
         self.botao_comunicado = ttk.Button(
             acoes, text="Salvar comunicado individual (Excel)",
             command=self.salvar_comunicado_individual, state="disabled",
@@ -235,8 +382,8 @@ class JanelaConsultas:
         self.botao_registrar.pack(side="left")
 
         abas = ttk.Notebook(detalhes)
-        abas.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
-        detalhes.rowconfigure(2, weight=1)
+        abas.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        detalhes.rowconfigure(3, weight=1)
 
         aba_atual = ttk.Frame(abas, padding=5)
         aba_historico = ttk.Frame(abas, padding=5)
@@ -288,6 +435,7 @@ class JanelaConsultas:
 
     def novo_meio(self, *, focar: bool = True) -> None:
         self.meio_edicao_id = None
+        self.botao_excluir_meio.config(state="disabled")
         selecionados = self.tabela_meios.selection()
         if selecionados:
             self.tabela_meios.selection_remove(*selecionados)
@@ -305,6 +453,7 @@ class JanelaConsultas:
         if meio is None:
             return
         self.meio_edicao_id = meio["id"]
+        self.botao_excluir_meio.config(state="normal")
         self.tipo_meio.set(meio["tipo"])
         self.valor_meio.delete(0, "end")
         self.valor_meio.insert(0, meio["valor"])
@@ -313,6 +462,7 @@ class JanelaConsultas:
 
     def atualizar_meios(self) -> None:
         self._limpar_tabela(self.tabela_meios)
+        self.botao_excluir_meio.config(state="disabled")
         self.meios_por_id = {}
         if not self.contato_selecionado:
             self.label_contatos.config(text="Selecione um devedor para ver os contatos.")
@@ -352,9 +502,117 @@ class JanelaConsultas:
         self.ao_selecionar_devedor()
         self.novo_meio(focar=False)
 
+    def excluir_meio(self) -> None:
+        if self.contato_selecionado is None or self.meio_edicao_id is None:
+            return
+        meio = self.meios_por_id.get(str(self.meio_edicao_id))
+        if meio is None:
+            return
+        if not messagebox.askyesno(
+            "Excluir contato",
+            f"Excluir {meio['tipo'].lower()} {meio['valor']} da lista deste devedor?",
+            parent=self.janela,
+        ):
+            return
+        try:
+            desativar_meio_contato(
+                self.contato_selecionado["id"], self.meio_edicao_id
+            )
+        except (OSError, ValueError) as erro:
+            messagebox.showerror("Contato", str(erro), parent=self.janela)
+            return
+        self.novo_meio(focar=False)
+        self.atualizar_meios()
+
+    def alternar_painel_lote(self) -> None:
+        if self.painel_lote.winfo_manager():
+            if self.previa_ajuizamento_ativa:
+                self.limpar_selecao_ajuizamento()
+            self.painel_lote.pack_forget()
+            self.botao_exibir_criterios.config(text="Marcação em lote ▸")
+        else:
+            self.painel_lote.pack(
+                before=self.quadro_tabela_devedores, fill="x", pady=(0, 4)
+            )
+            self.botao_exibir_criterios.config(text="Marcação em lote ▾")
+
     def _limpar_tabela(self, tabela: ttk.Treeview) -> None:
         for item in tabela.get_children():
             tabela.delete(item)
+
+    def _limpar_previa_ajuizamento(self, *_args) -> None:
+        if self.previa_ajuizamento_ativa:
+            for iid in self.devedores:
+                if self.tabela_devedores.exists(iid):
+                    self.tabela_devedores.move(iid, "", "end")
+        self.previa_ajuizamento_ativa = False
+        self.candidatas_ajuizamento = set()
+        self.botao_marcar_lote.config(state="disabled")
+        self.botao_limpar_selecao.config(state="disabled")
+        self.label_previa_ajuizamento.config(
+            text="Informe um critério para ver unidades ainda não ajuizadas."
+        )
+
+    def limpar_selecao_ajuizamento(self) -> None:
+        self.limite_debitos.set("")
+        self.limite_valor.set("")
+        self._limpar_previa_ajuizamento()
+        # As linhas ocultas mantêm os valores antigos do Treeview; reconstrói
+        # a lista lendo a situação atual de cada unidade no banco.
+        self.atualizar_lista_devedores()
+
+    def ver_candidatas_ajuizamento(self) -> None:
+        self._limpar_previa_ajuizamento()
+        if self.base_carga.empty or not self.codigo_condominio:
+            self.label_previa_ajuizamento.config(text="Selecione primeiro uma carga.")
+            return
+        try:
+            limite_debitos, limite_valor = _ler_criterios_ajuizamento(
+                self.limite_debitos.get(), self.limite_valor.get()
+            )
+        except ValueError as erro:
+            messagebox.showerror("Critérios", str(erro), parent=self.janela)
+            return
+        ajuizadas = {
+            economia for codigo, economia in listar_unidades_ajuizadas()
+            if codigo == self.codigo_condominio
+        }
+        self.candidatas_ajuizamento = _candidatas_por_criterios(
+            self.resumo_devedores,
+            limite_debitos=limite_debitos,
+            limite_valor=limite_valor,
+            ajuizadas=ajuizadas,
+        )
+        self.previa_ajuizamento_ativa = True
+        for iid, (economia, _nome) in self.devedores.items():
+            if economia not in self.candidatas_ajuizamento:
+                self.tabela_devedores.detach(iid)
+        self._limpar_devedor()
+        quantidade = len(self.candidatas_ajuizamento)
+        self.label_previa_ajuizamento.config(
+            text=f"Exibindo somente {quantidade} unidade(s) candidata(s). Confira antes de marcar."
+        )
+        self.botao_marcar_lote.config(state="normal" if quantidade else "disabled")
+        self.botao_limpar_selecao.config(state="normal")
+
+    def marcar_candidatas_ajuizadas(self) -> None:
+        if not self.candidatas_ajuizamento or not self.codigo_condominio:
+            return
+        try:
+            quantidade = definir_unidades_ajuizadas(
+                self.codigo_condominio, self.candidatas_ajuizamento, True
+            )
+        except (OSError, ValueError) as erro:
+            messagebox.showerror("Situação das unidades", str(erro), parent=self.janela)
+            return
+        self.limpar_selecao_ajuizamento()
+        self.label_previa_ajuizamento.config(
+            text=f"{quantidade} unidade(s) marcada(s) como ajuizada(s)."
+        )
+
+    def _selecionar_ajuizada_ficha(self, ajuizada: bool) -> None:
+        self.ajuizada_sim.set(ajuizada)
+        self.ajuizada_nao.set(not ajuizada)
 
     def _limpar_devedor(self) -> None:
         self.devedor_selecionado = None
@@ -363,9 +621,12 @@ class JanelaConsultas:
         self.novo_meio(focar=False)
         self.botao_novo_meio.config(state="disabled")
         self.botao_salvar_meio.config(state="disabled")
+        self.botao_excluir_meio.config(state="disabled")
         self.atualizar_meios()
         self.botao_comunicado.config(state="disabled")
         self.botao_registrar.config(state="disabled")
+        self.botao_salvar_ajuizada.config(state="disabled")
+        self._selecionar_ajuizada_ficha(False)
         for tabela in (
             self.tabela_debitos, self.tabela_historico, self.tabela_contatos
         ):
@@ -429,12 +690,17 @@ class JanelaConsultas:
         arquivos = ", ".join(item["nome"] for item in carga["arquivos"])
         prefixo = "Carga atual" if indice == 0 else "Carga anterior"
         self.label_arquivos.config(text=f"{prefixo}. PDF(s): {arquivos}")
+        self.atualizar_lista_devedores()
+
+    def atualizar_lista_devedores(self) -> None:
+        self._limpar_previa_ajuizamento()
         self._limpar_tabela(self.tabela_devedores)
         self._limpar_devedor()
         self.devedores = {}
-
+        self.resumo_devedores = pd.DataFrame()
         if self.base_carga.empty:
             return
+        ajuizadas = listar_unidades_ajuizadas()
         resumo = (
             self.base_carga.groupby(
                 ["economia", "nome_condomino"], sort=True, dropna=False
@@ -442,18 +708,80 @@ class JanelaConsultas:
             .agg(["sum", "count"])
             .reset_index()
         )
+        self.resumo_devedores = resumo
         for numero, linha in resumo.iterrows():
             economia = str(linha["economia"])
             nome = str(linha["nome_condomino"])
+            ajuizada = (self.codigo_condominio, economia) in ajuizadas
+            if ajuizada and self.mostrar_apenas_nao_ajuizadas.get():
+                continue
             iid = str(numero)
             self.devedores[iid] = (economia, nome)
             self.tabela_devedores.insert(
                 "", "end", iid=iid,
                 values=(
                     economia, nome, int(linha["count"]),
-                    _moeda(linha["sum"]),
+                    _moeda(linha["sum"]), "☑ SIM" if ajuizada else "☐ NÃO",
                 ),
             )
+
+    def alternar_ajuizada_na_lista(self, evento) -> None:
+        if self.tabela_devedores.identify_column(evento.x) != "#5":
+            return
+        iid = self.tabela_devedores.identify_row(evento.y)
+        if iid not in self.devedores:
+            return
+        economia, _nome = self.devedores[iid]
+        novo_estado = not unidade_ajuizada(self.codigo_condominio, economia)
+        try:
+            definir_unidade_ajuizada(self.codigo_condominio, economia, novo_estado)
+        except (OSError, ValueError) as erro:
+            messagebox.showerror("Situação da unidade", str(erro), parent=self.janela)
+            return
+        if self.previa_ajuizamento_ativa and novo_estado:
+            self.candidatas_ajuizamento.discard(economia)
+            for linha_id, (unidade, _nome) in self.devedores.items():
+                if unidade == economia:
+                    self.tabela_devedores.detach(linha_id)
+            self._limpar_devedor()
+            quantidade = len(self.candidatas_ajuizamento)
+            if quantidade == 0:
+                self.limpar_selecao_ajuizamento()
+                self.label_previa_ajuizamento.config(
+                    text="Todas as candidatas foram marcadas. Lista completa atualizada."
+                )
+                return
+            self.label_previa_ajuizamento.config(
+                text=f"Exibindo somente {quantidade} unidade(s) candidata(s). Confira antes de marcar."
+            )
+            self.botao_marcar_lote.config(state="normal" if quantidade else "disabled")
+            return
+        selecionado = self.devedores[iid]
+        self.atualizar_lista_devedores()
+        for linha_id, devedor in self.devedores.items():
+            if devedor == selecionado:
+                self.tabela_devedores.selection_set(linha_id)
+                self.ao_selecionar_devedor()
+                break
+
+    def salvar_ajuizada_ficha(self) -> None:
+        if self.devedor_selecionado is None:
+            return
+        economia, _nome = self.devedor_selecionado
+        try:
+            definir_unidade_ajuizada(
+                self.codigo_condominio, economia, self.ajuizada_sim.get()
+            )
+        except (OSError, ValueError) as erro:
+            messagebox.showerror("Situação da unidade", str(erro), parent=self.janela)
+            return
+        selecionado = self.devedor_selecionado
+        self.atualizar_lista_devedores()
+        for iid, devedor in self.devedores.items():
+            if devedor == selecionado:
+                self.tabela_devedores.selection_set(iid)
+                self.ao_selecionar_devedor()
+                break
 
     def ao_selecionar_devedor(self, _evento=None) -> None:
         selecao = self.tabela_devedores.selection()
@@ -487,7 +815,10 @@ class JanelaConsultas:
         self.botao_novo_meio.config(state="normal")
         self.botao_salvar_meio.config(state="normal")
         self.atualizar_meios()
-        self.botao_comunicado.config(state="normal")
+        ajuizada = unidade_ajuizada(self.codigo_condominio, economia)
+        self._selecionar_ajuizada_ficha(ajuizada)
+        self.botao_salvar_ajuizada.config(state="normal")
+        self.botao_comunicado.config(state="disabled" if ajuizada else "normal")
         self.botao_registrar.config(state="normal")
 
         for tabela in (
@@ -540,6 +871,12 @@ class JanelaConsultas:
         if self.devedor_selecionado is None:
             return
         economia, nome = self.devedor_selecionado
+        if unidade_ajuizada(self.codigo_condominio, economia):
+            messagebox.showerror(
+                "Comunicado", "A unidade está ajuizada e não pode receber comunicado.",
+                parent=self.janela,
+            )
+            return
         nome_seguro = re.sub(r"[^\w-]+", "_", nome, flags=re.UNICODE).strip("_")[:45]
         economia_segura = re.sub(r"[^\w-]+", "_", economia, flags=re.UNICODE).strip("_")[:20]
         destino = filedialog.asksaveasfilename(
@@ -556,6 +893,7 @@ class JanelaConsultas:
                 self.base_carga, caminho_modelo_padrao(),
                 codigo_condominio=self.codigo_condominio,
                 economia=economia, nome_condomino=nome,
+                unidades_ajuizadas=listar_unidades_ajuizadas(),
             )
             Path(destino).write_bytes(conteudo)
         except (OSError, ValueError) as erro:
@@ -606,12 +944,14 @@ class JanelaConsultas:
         canal.bind("<<ComboboxSelected>>", atualizar_opcoes)
         atualizar_opcoes()
 
-        ttk.Label(quadro, text="Ação realizada:").grid(row=2, column=0, sticky="w")
+        ttk.Label(quadro, text="Ocorrência:").grid(row=2, column=0, sticky="w")
         acao = ttk.Combobox(
             quadro,
             values=(
-                "Tentativa de contato", "Mensagem enviada",
-                "Ligação realizada", "Carta enviada", "Resposta recebida", "Outro",
+                "Tentativa sem resposta", "Contato realizado",
+                "Cliente solicitou boleto", "Boleto enviado ao cliente",
+                "Cliente informou pagamento", "Sem retorno do cliente",
+                "Mensagem enviada", "Ligação realizada", "Carta enviada", "Outro",
             ),
             state="readonly", width=25,
         )
@@ -652,6 +992,20 @@ class JanelaConsultas:
         ttk.Button(botoes, text="Registrar", command=confirmar).pack(
             side="right", padx=(0, 8)
         )
+        # Aproxima a janela da ficha e da tabela de débitos, sem sair da tela.
+        dialogo.update_idletasks()
+        ancora = self.tabela_debitos
+        largura = dialogo.winfo_reqwidth()
+        altura = dialogo.winfo_reqheight()
+        x = max(0, min(
+            ancora.winfo_rootx() + 20,
+            dialogo.winfo_screenwidth() - largura - 20,
+        ))
+        y = max(0, min(
+            ancora.winfo_rooty() + 20,
+            dialogo.winfo_screenheight() - altura - 50,
+        ))
+        dialogo.geometry(f"+{x}+{y}")
         resultado.focus_set()
         dialogo.grab_set()
 
