@@ -1,4 +1,4 @@
-name: Gerar aplicativo Windows
+name: Gerar Windows portátil (versão completa)
 
 on:
   workflow_dispatch:
@@ -8,13 +8,13 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Baixar o código
+      - name: Baixar código
         uses: actions/checkout@v4
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: '3.13'
           cache: pip
 
       - name: Instalar dependências
@@ -23,38 +23,31 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
-      - name: Compilar aplicativo
+      - name: Gerar executável
         run: pyinstaller --noconfirm --clean SistemaCobranca_Windows.spec
 
-      - name: Validar arquivos gerados
+      - name: Conferir executável e modo portátil
         shell: pwsh
         run: |
-          $executavel = "dist/SistemaCobranca.exe"
-          $marcador = "MODO_PORTATIL.txt"
-
-          if (-not (Test-Path $executavel)) {
-            throw "Executável não encontrado: $executavel"
+          if (-not (Test-Path 'dist/SistemaCobranca.exe')) {
+            throw 'O executável não foi gerado.'
+          }
+          if ((Get-Item 'dist/SistemaCobranca.exe').Length -lt 10MB) {
+            throw 'O executável parece incompleto.'
+          }
+          if (-not (Test-Path 'MODO_PORTATIL.txt')) {
+            throw 'Falta o marcador do modo portátil.'
           }
 
-          if ((Get-Item $executavel).Length -lt 10MB) {
-            throw "Executável incompleto: a DLL do Python pode não ter sido incorporada."
-          }
-
-          if (-not (Test-Path $marcador)) {
-            throw "Marcador do modo portátil não encontrado: $marcador"
-          }
-
-      - name: Compactar aplicativo portátil
+      - name: Montar entrega para a Carla
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path "Entrega_Carla" | Out-Null
-          Copy-Item "dist/SistemaCobranca.exe" "Entrega_Carla/SistemaCobranca.exe"
-          Copy-Item "MODO_PORTATIL.txt" "Entrega_Carla/MODO_PORTATIL.txt"
-          Compress-Archive `
-            -Path "Entrega_Carla" `
-            -DestinationPath "SistemaCobranca_Windows_portatil.zip"
+          New-Item -ItemType Directory -Path 'Entrega_Carla' | Out-Null
+          Copy-Item 'dist/SistemaCobranca.exe' 'Entrega_Carla/SistemaCobranca.exe'
+          Copy-Item 'MODO_PORTATIL.txt' 'Entrega_Carla/MODO_PORTATIL.txt'
+          Compress-Archive -Path 'Entrega_Carla' -DestinationPath 'SistemaCobranca_Windows_portatil.zip'
 
-      - name: Disponibilizar aplicativo
+      - name: Disponibilizar pacote
         uses: actions/upload-artifact@v4
         with:
           name: SistemaCobranca-Windows-portatil
